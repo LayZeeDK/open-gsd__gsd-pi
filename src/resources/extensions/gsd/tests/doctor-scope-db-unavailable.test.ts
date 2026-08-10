@@ -10,7 +10,7 @@ import {
   getTask,
   openDatabase,
 } from "../gsd-db.ts";
-import { chmodSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { filterDoctorIssues } from "../doctor-format.ts";
@@ -177,7 +177,9 @@ test("checkEngineHealth keeps PLAN checkbox divergence after stale projection fl
 
   const issues: any[] = [];
   const fixes: string[] = [];
-  await checkEngineHealth(base, issues, fixes);
+  // { repair: true }: this test's subject is what survives the flush, not
+  // whether an ungated diagnostic run performs one.
+  await checkEngineHealth(base, issues, fixes, { repair: true });
 
   const divergences = issues.filter((issue) => issue.code === "checkbox_db_status_divergence");
   assert.deepEqual(
@@ -227,7 +229,9 @@ test("checkEngineHealth retains ROADMAP divergence when projection repair remain
 
   const issues: any[] = [];
   const fixes: string[] = [];
-  await checkEngineHealth(base, issues, fixes);
+  // { repair: true }: the subject is that a repair which stays stale does not
+  // clear the diagnostic — the run has to be allowed to attempt one.
+  await checkEngineHealth(base, issues, fixes, { repair: true });
 
   assert.deepEqual(
     issues.filter((issue) => issue.code === "checkbox_db_status_divergence").map((issue) => issue.unitId),
@@ -1153,7 +1157,9 @@ test("checkEngineHealth clears artifact_file_missing after projection re-render 
 
   const issues: any[] = [];
   const fixes: string[] = [];
-  await checkEngineHealth(base, issues, fixes);
+  // { repair: true }: the subject is the post-re-render diagnostic cleanup, so
+  // the run must actually be permitted to re-render.
+  await checkEngineHealth(base, issues, fixes, { repair: true });
 
   assert.ok(fixes.includes("re-rendered missing projections for M001"));
   assert.equal(
@@ -1164,4 +1170,49 @@ test("checkEngineHealth clears artifact_file_missing after projection re-render 
   const contextIssue = issues.find((issue) => issue.code === "artifact_user_content_missing" && issue.file === "phases/01-foundation/01-CONTEXT.md");
   assert.ok(contextIssue, "doctor should still report missing user content that projection repair did not recreate");
   assert.equal(contextIssue.severity, "warning");
+});
+
+// Paired with the { repair: true } test above on a byte-identical fixture: that
+// one proves the flush still happens on request, this one proves it does not
+// happen otherwise. Neither is load-bearing without the other — a fix that
+// simply disabled the re-render would keep this one green.
+test("checkEngineHealth leaves projections alone when repair was not requested", async (t) => {
+  const base = mkdtempSync(join(tmpdir(), "gsd-doctor-readonly-projection-"));
+  t.after(() => rmSync(base, { recursive: true, force: true }));
+
+  const gsdDir = join(base, ".gsd");
+  mkdirSync(gsdDir, { recursive: true });
+
+  openDatabase(join(gsdDir, "gsd.db"));
+  insertMilestone({ id: "M001", title: "Foundation", status: "active", planning: { vision: "Ship the foundation." } });
+  insertSlice({ id: "S01", milestoneId: "M001", title: "Slice", status: "pending", risk: "low", depends: [], sequence: 1 });
+  insertArtifact({
+    path: "phases/01-foundation/01-ROADMAP.md",
+    artifact_type: "ROADMAP",
+    milestone_id: "M001",
+    slice_id: null,
+    task_id: null,
+    full_content: "# stale row only\n",
+  });
+  appendEvent(base, {
+    cmd: "plan-milestone",
+    params: { milestoneId: "M001" },
+    ts: "2999-01-01T00:00:00.000Z",
+    actor: "agent",
+  });
+
+  const issues: any[] = [];
+  const fixes: string[] = [];
+  await checkEngineHealth(base, issues, fixes);
+
+  assert.deepEqual(fixes, [], "a diagnostic run must not report applied fixes");
+  assert.ok(
+    issues.some((issue) => issue.code === "artifact_file_missing" && issue.file === "phases/01-foundation/01-ROADMAP.md"),
+    "the missing-artifact diagnostic must survive a run that was not allowed to recreate the file",
+  );
+  assert.equal(
+    existsSync(join(base, "phases", "01-foundation", "01-ROADMAP.md")),
+    false,
+    "a diagnostic run must not write a projection file",
+  );
 });

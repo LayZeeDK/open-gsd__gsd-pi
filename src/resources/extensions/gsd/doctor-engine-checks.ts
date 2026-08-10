@@ -790,9 +790,16 @@ export async function checkEngineHealth(
   // ── Projection drift detection ──────────────────────────────────────────
   // If the DB is available, check whether markdown projections are stale
   // relative to the event log and re-render them.
+  //
+  // Gated on options.repair like the three sibling repair sites above, because
+  // the re-render WRITES. Without the gate, callers that pass no options at all
+  // -- `runGSDDoctor(cwd)` from `gsd headless doctor`, and the forensics scan --
+  // mutate projections and print "Fixes applied:" from what the operator asked
+  // to be a diagnostic. `doctor.ts` already passes `{ repair: fix && !dryRun }`,
+  // so `--fix` and `--dry-run` keep behaving exactly as before.
   const reRenderedMilestoneIds: string[] = [];
   try {
-    if (isDbAvailable()) {
+    if (isDbAvailable() && options?.repair) {
       const eventLogPath = workflowEventLogPath(basePath);
       const events = readEvents(eventLogPath);
       if (events.length > 0) {
