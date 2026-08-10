@@ -10,7 +10,16 @@ export interface WorktreeSegment {
 export function normalizeWorktreePathForCompare(path: string): string {
   let normalized: string;
   try {
-    normalized = realpathSync(path);
+    // realpathSync.native, not the plain resolver: on Windows only the native
+    // one expands 8.3 short components (LARSGY~1 -> LarsGyrupBrinkNielse).
+    // Every ~/.gsd escape guard below compares a walked-up directory against
+    // gsdHome(), which derives from homedir() (long, via USERPROFILE) while the
+    // walk itself can start from an os.tmpdir() path that carries the short
+    // form. Under the plain resolver those two spellings of one directory never
+    // compare equal, so the guard misses and the walk adopts the user's HOME as
+    // the project root. Matches the sibling guards (repo-identity
+    // normalizeForGuard, external-state-store isSameFilesystemPath).
+    normalized = realpathSync.native(path);
   } catch {
     normalized = resolve(path);
   }
