@@ -10,6 +10,7 @@ import {
   completeLegacyTaskForVerifiedAttempt,
   readDomainOperationFence,
 } from "./db/writers/lifecycle-commands.js";
+import { getErrorMessageChain } from "./error-utils.js";
 import type { ExecutionInvocation } from "./execution-invocation.js";
 import { requireExactMergedUatClosureEvidence } from "./exact-merged-uat-closure.js";
 import {
@@ -252,7 +253,9 @@ async function renderTaskSummaryProjection(
     );
     if (!wroteSummary) throw new Error("summary projection write returned false");
   } catch (error) {
-    throw new Error(`Task completion summary projection failed: ${(error as Error).message}`);
+    throw new Error(`Task completion summary projection failed: ${getErrorMessageChain(error)}`, {
+      cause: error,
+    });
   }
 
   clearPathCache();
@@ -276,7 +279,9 @@ async function renderPublishedTaskCompletionProjections(
     const wrotePlan = await renderPlanCheckboxes(basePath, task.milestoneId, task.sliceId);
     if (!wrotePlan) throw new Error("plan projection write returned false");
   } catch (error) {
-    throw new Error(`Task completion PLAN projection failed: ${(error as Error).message}`);
+    throw new Error(`Task completion PLAN projection failed: ${getErrorMessageChain(error)}`, {
+      cause: error,
+    });
   }
   return summaryPath;
 }

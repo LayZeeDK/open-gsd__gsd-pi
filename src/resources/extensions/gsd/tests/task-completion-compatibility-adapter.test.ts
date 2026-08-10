@@ -878,6 +878,51 @@ test("verified publication alone completes the legacy Task and checks its projec
   );
 });
 
+test("a PLAN projection failure surfaces the underlying cause, not just the wrapper", async () => {
+  // The operative failure text lives on `error.cause`: the native lock throws
+  // `new Error("native projection root identity locking failed", { cause })`
+  // where the cause carries the OS detail. Re-wrapping with only `.message`
+  // discarded it, so the operator saw "Task completion PLAN projection failed:
+  // native projection root identity locking failed" and had to go dig out the
+  // `os error 32` by hand -- the reason the recovery runbook needs its extra
+  // step. classifyFailure derives the auto-mode banner from this same message,
+  // so flattening the chain at the wrap point fixes both at once.
+  const { publishVerifiedTaskCompletion, stageTaskCompletion } = await subject();
+  const { basePath, attemptId } = createFixture();
+  await stageTaskCompletion(stageInput(basePath));
+  recordPassingHostVerdict(basePath, attemptId);
+  _setManagedMutationBoundaryForTest((boundary, target) => {
+    if (boundary === "before-write" && target.endsWith("PLAN.md")) {
+      throw new Error("native projection root identity locking failed", {
+        cause: new Error("os error 32 at createInitialProjectionDirectory"),
+      });
+    }
+  });
+
+  const rejection = await publishVerifiedTaskCompletion(publishInput(basePath, attemptId)).then(
+    () => null,
+    (error: unknown) => error as Error,
+  );
+
+  assert.ok(rejection, "the PLAN projection failure must still reject");
+  assert.match(rejection.message, /Task completion PLAN projection failed/);
+  assert.match(
+    rejection.message,
+    /native projection root identity locking failed/,
+    "the wrapper's own layer must survive",
+  );
+  assert.match(
+    rejection.message,
+    /os error 32 at createInitialProjectionDirectory/,
+    "the cause carries the only actionable detail, so it must reach the message",
+  );
+  assert.equal(
+    (rejection.cause as Error | undefined)?.message,
+    "native projection root identity locking failed",
+    "the chain stays intact for programmatic consumers, not just the string",
+  );
+});
+
 test("ordinary verification and milestone validation cannot bypass exact-merged UAT closure", async () => {
   const { publishVerifiedTaskCompletion, stageTaskCompletion } = await subject();
   const { basePath, attemptId } = createFixture();
