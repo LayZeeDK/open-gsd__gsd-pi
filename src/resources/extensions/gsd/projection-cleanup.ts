@@ -19,6 +19,7 @@ import { gsdProjectionRoot, gsdRoot } from "./paths.js";
 import { withProjectionMutationSync } from "./database-maintenance-fence.js";
 import { recordManagedProjectionFile } from "./managed-projection-history.js";
 import { removeProjectionFileSync } from "./atomic-write.js";
+import { stripProjectionStamp } from "./markdown-renderer.js";
 
 export interface OperationFencedProjectionCleanupInput {
   artifactPath: string;
@@ -86,10 +87,19 @@ export function removeOwnedPlanProjection(basePath: string, planPath: string): b
 
   if (existsSync(planPath)) {
     const content = readFileSync(planPath, "utf8");
-    const contentSha = computeProjectionSha(content);
+    // Both sides stripped. artifact.full_content is stamped, but the on-disk
+    // plan may predate the stamp (introduced in v1.13.0) or have been left at a
+    // legacy path by a layout migration while the artifact was re-rendered at
+    // the new one. Comparing raw then leaves artifactOwnsCurrentContent
+    // permanently false and strands the stale plan file on disk, because this
+    // function refuses to delete a projection it cannot prove it owns.
+    //
+    // Migration tolerance only -- no current writer emits an unstamped managed
+    // projection. See the note in commands-handlers.ts formatCompatHealthLine.
+    const contentSha = computeProjectionSha(stripProjectionStamp(content));
     const markerOwnsCurrentContent = marker.projections[projectionKey]?.sha === contentSha;
     const artifactOwnsCurrentContent = artifact?.artifact_type === "PLAN" &&
-      computeProjectionSha(artifact.full_content) === contentSha;
+      computeProjectionSha(stripProjectionStamp(artifact.full_content)) === contentSha;
     if (!markerOwnsCurrentContent && !artifactOwnsCurrentContent) return false;
     removeProjectionFileSync(planPath);
   } else if (artifact?.artifact_type !== "PLAN") {

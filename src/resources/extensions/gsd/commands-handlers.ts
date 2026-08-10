@@ -193,15 +193,50 @@ export async function formatCompatHealthLine(basePath: string): Promise<string> 
     const { readCompatMarker, computeProjectionSha } = await import("./compat/compat-marker.js");
     const marker = readCompatMarker(basePath);
 
+    const { stripProjectionStamp } = await import("./markdown-renderer.js");
+
+    // Strip only for the .gsd map. .planning projections are never stamped, and
+    // their sha is written AND read raw everywhere else (planning-compat.ts,
+    // external-planning-edit.ts), so stripping here would make doctor disagree
+    // with the reconcile detector. Its passthrough entries are arbitrary user
+    // files too, where a trailing stamp-shaped line would be real content.
     const countDrifted = (
       entries: Record<string, { sha: string }>,
       root: string,
+      stripStamp = false,
     ): number => {
       let drifted = 0;
       for (const [rel, entry] of Object.entries(entries)) {
         const abs = join(basePath, root, rel);
         if (!existsSync(abs)) continue;
-        if (computeProjectionSha(readFileSync(abs, "utf-8")) !== entry.sha) drifted++;
+        const content = readFileSync(abs, "utf-8");
+        if (!stripStamp) {
+          if (computeProjectionSha(content) !== entry.sha) drifted++;
+          continue;
+        }
+        // Accept EITHER form. writeAndStore mints the baseline from the stamped
+        // bytes it just wrote, so the raw comparison is the ordinary match. The
+        // stripped one is migration tolerance: the state-version stamp arrived in
+        // v1.13.0, so a disk copy rendered before that -- or left at a legacy path
+        // by a layout migration, while the artifact was re-rendered at the new one
+        // -- is unstamped against a stamped baseline. Without it those read as
+        // drifted forever, and this line, unlike the reconcile detector, has no DB
+        // fallback to self-heal against. It cannot mask real drift: changed
+        // content matches the baseline neither stripped nor raw.
+        //
+        // No CURRENT writer produces that mismatch. Both once-cited unstamped
+        // writers are gone: renderSummaryProjection routes through
+        // writeTaskSummaryProjection (stamps and records), and renderPlanProjection
+        // has had no production caller since before v1.14.0 -- renderAllProjections
+        // is forbidden from calling it by the #3651 regression test. Do not
+        // reintroduce this strip on the WRITE side to "fix" a live writer; there
+        // isn't one.
+        if (
+          computeProjectionSha(stripProjectionStamp(content)) !== entry.sha
+          && computeProjectionSha(content) !== entry.sha
+        ) {
+          drifted++;
+        }
       }
       return drifted;
     };
@@ -221,7 +256,7 @@ export async function formatCompatHealthLine(basePath: string): Promise<string> 
     if (gsdEntryCount === 0) {
       lines.push("  Compat health (.gsd):    no baseline (run /gsd sync to establish)");
     } else {
-      const gsdDrifted = countDrifted(marker.projections, ".gsd");
+      const gsdDrifted = countDrifted(marker.projections, ".gsd", true);
       lines.push(
         `  Compat health (.gsd):    ${gsdDrifted === 0 ? "OK" : `${gsdDrifted} file(s) drifted — run /gsd sync`}`,
       );

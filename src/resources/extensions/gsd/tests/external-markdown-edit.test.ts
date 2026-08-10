@@ -169,3 +169,35 @@ test("modeled drift blocks with an explicit route and cannot run repair", async 
   assert.deepEqual(readFileSync(join(base, ".gsd", rel)), sourceBefore);
   assert.deepEqual(readCompatMarker(base), markerBefore);
 });
+
+// The detector hashes the projection's RAW bytes, matching the sha
+// writeAndStore() mints into the marker from those same bytes. Both sides are
+// the stamped form, so a stamped projection compares equal to its own baseline
+// without any normalization. Keeping this raw is what lets
+// preserveProjectionEvidence re-read the file and reach the same sha; a
+// stripped `actualSha` here made that guard mismatch and silently drop the
+// quarantine copy for every stamped projection.
+//
+// Negative control: a real external edit under a stamp must still be caught.
+test("detect still reports drift when the content itself changed under a stamp", async () => {
+  const base = makeTmpBase();
+  const rel = "m1/roadmap.md";
+  mkdirSync(join(base, ".gsd", "m1"), { recursive: true });
+  writeFileSync(
+    join(base, ".gsd", rel),
+    "# Roadmap\n\n- [ ] S1 reopened by hand\n<!-- gsd:state-version=7:1750000000000 -->\n",
+    "utf-8",
+  );
+  writeCompatMarker(base, {
+    schema: 1,
+    lastWriter: "gsd-pi",
+    lastProjectedAt: "2026-06-21T00:00:00.000Z",
+    projections: {
+      [rel]: { sha: computeProjectionSha("# Roadmap\n\n- [x] S1 done\n"), entities: ["m1"] },
+    },
+    piVersion: "1.4.0",
+  });
+
+  const drift = await externalMarkdownEditHandler.detect(stubState, ctx(base));
+  assert.equal(drift.length, 1);
+});
