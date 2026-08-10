@@ -800,9 +800,58 @@ function activateDeferredApprovalGate(basePath: string): void {
   hostWriteGateAdapter.setPending(gateId, basePath);
 }
 
+/**
+ * Coerce an `ask_user_questions` payload into the array both readers assume.
+ *
+ * The MCP schema declares `questions` as `type: "array"`, and this file already
+ * guards `Array.isArray(question.options)` nearby, so the array assumption is
+ * intended -- the guard was just too weak. `?? []` catches null and undefined
+ * only, so any other shape reached `.find()` / `for...of` and threw
+ * `questions.find is not a function`, which aborts the extension and with it
+ * the whole /gsd workflow. Observed via the external-engine relay path, where
+ * the payload arrives as `event.args` rather than `event.input`.
+ *
+ * A JSON string that decodes to an array is recovered, since relaying a
+ * tool-call argument unparsed is the most likely way a non-array gets here.
+ */
+export function normalizeAskUserQuestions(value: unknown): Array<Record<string, unknown>> {
+  if (Array.isArray(value)) return value as Array<Record<string, unknown>>;
+  if (value == null) return [];
+
+  if (typeof value === "string") {
+    try {
+      const parsed: unknown = JSON.parse(value);
+      if (Array.isArray(parsed)) return parsed as Array<Record<string, unknown>>;
+    } catch {
+      // Not JSON — fall through to the empty result.
+    }
+  }
+
+  return [];
+}
+
+/**
+ * Pick the questions payload from the several places a hook event can carry it,
+ * normalizing each candidate before judging it.
+ *
+ * `?? `-ing the RAW values first and normalizing once is the obvious form and
+ * is wrong: `??` skips nullish only, so a present-but-non-array
+ * `event.input.questions` -- precisely the shape normalizeAskUserQuestions
+ * exists for -- short-circuits the remaining candidates and then normalizes to
+ * [], discarding a perfectly good `event.args` or gate-details payload.
+ */
+export function selectAskUserQuestions(...candidates: unknown[]): Array<Record<string, unknown>> {
+  for (const candidate of candidates) {
+    const questions = normalizeAskUserQuestions(candidate);
+    if (questions.length > 0) return questions;
+  }
+
+  return [];
+}
+
 function extractGateQuestionId(input: unknown): string | undefined {
-  const questions: Array<{ id?: unknown }> = (input as { questions?: unknown })?.questions as Array<{ id?: unknown }> ?? [];
-  const match = questions.find((question) => typeof question?.id === "string" && isGateQuestionId(question.id));
+  const questions = normalizeAskUserQuestions((input as { questions?: unknown })?.questions);
+  const match = questions.find((question) => typeof question?.id === "string" && isGateQuestionId(question.id as string));
   return typeof match?.id === "string" ? match.id : undefined;
 }
 
@@ -1809,7 +1858,11 @@ export function registerHooks(
 
     const details = resolveAskUserQuestionsGateDetails(event);
 
-    const questions: any[] = (event.input as any)?.questions ?? details?.questions ?? [];
+    const questions: any[] = selectAskUserQuestions(
+      (event.input as any)?.questions,
+      (event as any)?.args?.questions,
+      details?.questions,
+    );
     const gateResult = applyAskUserQuestionsGateResult({
       basePath,
       questions,
