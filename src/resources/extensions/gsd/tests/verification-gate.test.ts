@@ -22,7 +22,7 @@ import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { discoverCommands, runVerificationGate, runVerificationGateForTargets, formatFailureContext, captureRuntimeErrors, runDependencyAudit, isLikelyCommand, validateVerificationCommand } from "../verification-gate.ts";
+import { discoverCommands, runVerificationGate, runVerificationGateForTargets, formatFailureContext, captureRuntimeErrors, runDependencyAudit, isLikelyCommand, resolveVerificationShell, validateVerificationCommand } from "../verification-gate.ts";
 import type { CaptureRuntimeErrorsOptions, DependencyAuditOptions } from "../verification-gate.ts";
 import { validatePreferences } from "../preferences.ts";
 
@@ -1537,5 +1537,123 @@ describe("verification-gate: python normalization (#4416)", () => {
     assert.equal(typeof result.passed, "boolean");
     assert.equal(result.checks.length, 1);
     assert.ok(result.checks[0].durationMs >= 0);
+  });
+});
+
+// ─── Verification shell selection ────────────────────────────────────────────
+
+describe("verification-gate: shell selection", () => {
+  const PROGRAM_FILES = "C:\\Program Files";
+  const GIT_BASH = "C:\\Program Files\\Git\\usr\\bin\\bash.exe";
+  const LOCAL_APP_DATA = "C:\\Users\\dev\\AppData\\Local";
+  const LOCAL_GIT_BASH = "C:\\Users\\dev\\AppData\\Local\\Programs\\Git\\usr\\bin\\bash.exe";
+  const noneExist = (): boolean => false;
+  const allExist = (): boolean => true;
+
+  // Verify lines are POSIX shell commands (`test -f x`, `grep -q y z`).
+  // Handing them to cmd.exe fails on that syntax no matter whether the task
+  // itself succeeded, so the gate raised a verification-abort for work that
+  // had actually passed.
+  test("prefers a Git for Windows bash over cmd on win32", () => {
+    const shell = resolveVerificationShell(
+      "win32",
+      { ProgramFiles: PROGRAM_FILES },
+      (path) => path === GIT_BASH,
+    );
+
+    assert.equal(shell.bin, GIT_BASH);
+    assert.deepStrictEqual(
+      shell.args("test -f README.md"),
+      ["-o", "pipefail", "-c", "test -f README.md"],
+    );
+  });
+
+  // Spawning bash.exe directly skips the launcher that puts usr/bin on PATH,
+  // so builtins like `test` work while `grep`/`sed` fail with exit 127. The
+  // prefix is derived from the resolved bash path, never a hardcoded constant.
+  test("prepends the resolved bash's usr/bin to PATH", () => {
+    const shell = resolveVerificationShell(
+      "win32",
+      { LOCALAPPDATA: LOCAL_APP_DATA },
+      (path) => path === LOCAL_GIT_BASH,
+    );
+
+    assert.equal(shell.pathPrefix, dirname(LOCAL_GIT_BASH));
+  });
+
+  test("honours an explicit GSD_VERIFICATION_SHELL override", () => {
+    const shell = resolveVerificationShell(
+      "win32",
+      { GSD_VERIFICATION_SHELL: "D:\\msys64\\usr\\bin\\bash.exe", ProgramFiles: PROGRAM_FILES },
+      allExist,
+    );
+
+    assert.equal(shell.bin, "D:\\msys64\\usr\\bin\\bash.exe");
+  });
+
+  // The override names a SHELL, and `sh.exe` sits in the same `usr/bin` as the
+  // bash this resolver looks for, so it is a natural thing to point it at.
+  // Handing a non-bash shell bash's own argv fails every check with `Illegal
+  // option -o pipefail` -- a hard break with no fallback, from a variable the
+  // operator set to make verification work.
+  test("does not hand bash-only argv to a non-bash GSD_VERIFICATION_SHELL", () => {
+    const shell = resolveVerificationShell(
+      "win32",
+      { GSD_VERIFICATION_SHELL: "C:\\Program Files\\Git\\usr\\bin\\sh.exe" },
+      allExist,
+    );
+
+    assert.equal(shell.bin, "C:\\Program Files\\Git\\usr\\bin\\sh.exe");
+    assert.ok(
+      !shell.args("test -f README.md").includes("pipefail"),
+      "a non-bash shell must not be given `-o pipefail`",
+    );
+    // The portable argv still ends with the command, as the off-win32 path does.
+    assert.equal(shell.args("test -f README.md").at(-1), "test -f README.md");
+  });
+
+  // Machines without Git for Windows must keep today's behaviour rather than
+  // failing to spawn anything at all.
+  test("falls back to cmd when no POSIX shell is present on win32", () => {
+    const shell = resolveVerificationShell("win32", { ProgramFiles: PROGRAM_FILES }, noneExist);
+
+    assert.equal(shell.bin, "cmd");
+    assert.deepStrictEqual(shell.args("test -f README.md"), ["/c", "test -f README.md"]);
+    assert.equal(shell.pathPrefix, null);
+  });
+
+  // A bare "bash" is deliberately never a candidate: on Windows, PATH commonly
+  // resolves it to the WSL launcher stub, which boots a VM.
+  test("never selects a bare bash name", () => {
+    const shell = resolveVerificationShell("win32", { ProgramFiles: PROGRAM_FILES }, allExist);
+
+    assert.notEqual(shell.bin, "bash");
+    assert.ok(shell.bin.endsWith("bash.exe"), `expected an explicit bash path, got: ${shell.bin}`);
+  });
+
+  test("keeps the existing sh contract off win32", () => {
+    const shell = resolveVerificationShell("linux", {}, allExist);
+
+    assert.equal(shell.bin, "sh");
+    assert.equal(shell.pathPrefix, null);
+    const args = shell.args("test -f README.md");
+    assert.equal(args[0], "-c");
+    assert.equal(args.at(-1), "test -f README.md");
+  });
+
+  // End to end on the real host: the behaviour the whole patch exists for.
+  test("runs a POSIX verify command through the real gate", () => {
+    const dir = makeTempDir("vg-posix-shell");
+    try {
+      writeFileSync(join(dir, "README.md"), "# hi\n");
+      const result = withRtkDisabled(() => runVerificationGate({
+        cwd: dir,
+        preferenceCommands: ["test -f README.md"],
+      }));
+
+      assert.equal(result.passed, true, `expected pass, got: ${JSON.stringify(result.checks)}`);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

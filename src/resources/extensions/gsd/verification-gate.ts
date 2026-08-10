@@ -5,7 +5,7 @@
 
 import { spawnSync, type SpawnSyncReturns } from "node:child_process";
 import { existsSync, readFileSync, readdirSync, type Dirent } from "node:fs";
-import { join, basename } from "node:path";
+import { join, basename, delimiter, dirname } from "node:path";
 import type { AuditWarning, RuntimeError, VerificationCheck, VerificationResult } from "./types.js";
 import { DEFAULT_COMMAND_TIMEOUT_MS } from "./constants.js";
 import { rewriteCommandWithRtk } from "../shared/rtk.js";
@@ -671,7 +671,97 @@ export interface VerificationTarget {
   preferenceCommands?: string[];
 }
 
-function verificationChildEnvironment(): NodeJS.ProcessEnv {
+/**
+ * Where to look for a POSIX shell on Windows, in priority order.
+ *
+ * Deliberately NOT a bare "bash": on this platform PATH commonly resolves that
+ * to the WSL launcher stub, which boots a VM instead of running the command.
+ */
+function windowsBashCandidates(env: NodeJS.ProcessEnv): string[] {
+  const candidates: string[] = [];
+  const explicit = env["GSD_VERIFICATION_SHELL"]?.trim();
+  if (explicit) candidates.push(explicit);
+
+  for (const root of [env["ProgramFiles"], env["ProgramW6432"], env["ProgramFiles(x86)"]]) {
+    if (root) candidates.push(join(root, "Git", "usr", "bin", "bash.exe"));
+  }
+  if (env["LOCALAPPDATA"]) {
+    candidates.push(join(env["LOCALAPPDATA"], "Programs", "Git", "usr", "bin", "bash.exe"));
+  }
+
+  return candidates;
+}
+
+export interface VerificationShell {
+  /** Executable to spawn. */
+  bin: string;
+  /** Build the argv for a given command string. */
+  args: (command: string) => string[];
+  /**
+   * Directory to prepend to PATH, or null. Spawning Git Bash directly skips the
+   * launcher that puts `usr/bin` on PATH, so shell builtins like `test` work
+   * while external tools like `grep` and `sed` fail with exit 127.
+   */
+  pathPrefix: string | null;
+}
+
+/** Is this resolved path a bash, as opposed to some other POSIX shell? */
+function isBashExecutable(shellPath: string): boolean {
+  return /^bash(\.exe)?$/i.test(basename(shellPath));
+}
+
+const POSIX_SHELL_ARGS = (command: string): string[] => [
+  "-c",
+  "if command -v bash >/dev/null 2>&1; then exec bash -o pipefail -c \"$1\" verification-gate; fi\nexec sh -c \"$1\" verification-gate",
+  "verification-gate",
+  command,
+];
+
+/**
+ * Choose the shell that runs verify commands.
+ *
+ * Verify lines are POSIX shell commands (`test -f x`, `grep -q y z`, pipelines).
+ * On Windows they were handed to `cmd.exe`, which fails on that syntax no matter
+ * whether the task itself succeeded -- the gate then reported a
+ * `verification-abort` for work that had actually passed. Prefer a real POSIX
+ * shell when the host has one, and fall back to `cmd` when it does not so
+ * machines without Git for Windows keep today's behaviour.
+ *
+ * `exists` is injected so every branch is testable without depending on what
+ * happens to be installed on the machine running the tests.
+ */
+export function resolveVerificationShell(
+  platform: NodeJS.Platform = process.platform,
+  env: NodeJS.ProcessEnv = process.env,
+  exists: (path: string) => boolean = existsSync,
+): VerificationShell {
+  if (platform !== "win32") {
+    return { bin: "sh", args: POSIX_SHELL_ARGS, pathPrefix: null };
+  }
+
+  const bash = windowsBashCandidates(env).find((candidate) => exists(candidate));
+  if (!bash) {
+    return { bin: "cmd", args: (command) => ["/c", command], pathPrefix: null };
+  }
+
+  return {
+    bin: bash,
+    // `-o pipefail` is a bashism, and only the Git-for-Windows candidates are
+    // known to be bash. GSD_VERIFICATION_SHELL names an arbitrary shell -- and
+    // `sh.exe` ships in the same `usr/bin` as the bash this looks for -- so
+    // handing it bash's argv fails EVERY check with `Illegal option -o
+    // pipefail` rather than falling back. Anything not named bash gets the
+    // portable argv, which re-execs bash when it is on PATH and runs sh
+    // otherwise.
+    args: isBashExecutable(bash)
+      ? (command) => ["-o", "pipefail", "-c", command]
+      : POSIX_SHELL_ARGS,
+    // `<git>/usr/bin/bash.exe` -> `<git>/usr/bin`, derived rather than hardcoded.
+    pathPrefix: dirname(bash),
+  };
+}
+
+function verificationChildEnvironment(pathPrefix: string | null = null): NodeJS.ProcessEnv {
   const env = { ...process.env };
   for (const key of [
     "GSD_PROJECT_ROOT",
@@ -682,6 +772,14 @@ function verificationChildEnvironment(): NodeJS.ProcessEnv {
   ]) {
     delete env[key];
   }
+
+  if (pathPrefix) {
+    // Windows env keys are case-insensitive but the object's are not, so find
+    // whichever spelling this process actually has.
+    const pathKey = Object.keys(env).find((key) => key.toLowerCase() === "path") ?? "PATH";
+    env[pathKey] = `${pathPrefix}${delimiter}${env[pathKey] ?? ""}`;
+  }
+
   return env;
 }
 
@@ -743,18 +841,10 @@ export function runVerificationGate(options: RunVerificationGateOptions): Verifi
     const rewrittenCommand = normalizePythonCommand(rewriteCommandWithRtk(command));
     // Pass the command string as an argument to the shell explicitly
     // to avoid Node.js DEP0190 (spawnSync with shell: true and no args).
-    const shellBin = process.platform === "win32" ? "cmd" : "sh";
-    const shellArgs = process.platform === "win32"
-      ? ["/c", rewrittenCommand]
-      : [
-          "-c",
-          "if command -v bash >/dev/null 2>&1; then exec bash -o pipefail -c \"$1\" verification-gate; fi\nexec sh -c \"$1\" verification-gate",
-          "verification-gate",
-          rewrittenCommand,
-        ];
-    const result: SpawnSyncReturns<string> = spawnSync(shellBin, shellArgs, {
+    const shell = resolveVerificationShell();
+    const result: SpawnSyncReturns<string> = spawnSync(shell.bin, shell.args(rewrittenCommand), {
       cwd: options.cwd,
-      env: verificationChildEnvironment(),
+      env: verificationChildEnvironment(shell.pathPrefix),
       stdio: "pipe",
       encoding: "utf-8",
       timeout: options.commandTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS,
