@@ -163,10 +163,16 @@ function defaultGetProcessStartTime(pid: number): number | null {
 }
 
 function normalizeProcessCwd(value: string): string {
-  return value.startsWith('\\\\?\\') ? value.slice(4) : value;
+  const unprefixed = value.startsWith('\\\\?\\') ? value.slice(4) : value;
+  // The Win32 PEB `CurrentDirectory` always ends with a separator (`D:\proj\`)
+  // while a projectDir never does, so without this the same-project comparison
+  // in isSameProjectMcpProcess can never match and every stale PID is reported
+  // unverified. Roots ("D:\", "/") ARE their trailing separator — stripping it
+  // would leave "D:" / "" and match the wrong directory — so leave them alone.
+  return unprefixed.length > 3 ? unprefixed.replace(/[\\/]+$/, '') : unprefixed;
 }
 
-function defaultGetProcessCwd(pid: number): string | null {
+export function defaultGetProcessCwd(pid: number): string | null {
   if (process.platform === 'win32') {
     try {
       const out = execFileSync(
@@ -175,7 +181,12 @@ function defaultGetProcessCwd(pid: number): string | null {
           '-NoProfile',
           '-NonInteractive',
           '-Command',
-          `$pid=${pid};$t=@'
+          // `$pid` is a READ-ONLY PowerShell automatic variable holding the
+          // shell's own pid. Assigning to it raises "Cannot overwrite variable
+          // PID because it is read-only or constant", which stdio 'ignore' on
+          // stderr swallows, leaving $pid pointing at PowerShell itself — so
+          // the probe reported the wrong process's cwd. Use a private name.
+          `$gsdTargetPid=${pid};$t=@'
 using System;using System.Runtime.InteropServices;using System.Text;
 public static class GsdProcCwd{
  [DllImport("kernel32.dll")] public static extern IntPtr OpenProcess(int a,bool b,int p);
@@ -198,7 +209,7 @@ public static class GsdProcCwd{
   if(!ReadProcessMemory(h,buf,ch,ch.Length,out rd))return null;
   return Encoding.Unicode.GetString(ch,0,len);}finally{CloseHandle(h);}}
 }
-'@;Add-Type -TypeDefinition $t -ErrorAction Stop;[GsdProcCwd]::G($pid)`,
+'@;Add-Type -TypeDefinition $t -ErrorAction Stop;[GsdProcCwd]::G($gsdTargetPid)`,
         ],
         { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] },
       ).trim();

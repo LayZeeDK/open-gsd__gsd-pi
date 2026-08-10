@@ -1,10 +1,13 @@
 import { describe, test, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { join, sep } from 'node:path';
 import { tmpdir } from 'node:os';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
 
 import {
+  defaultGetProcessCwd,
   readMcpRegistry,
   registerMcpInstance,
   sweepProjectOrphanMcpServers,
@@ -487,6 +490,137 @@ describe('registerMcpInstance', () => {
       { pid: 9998, signal: 'SIGKILL' },
     ]);
     assert.equal(readOwnEntry(registryPath, tmp)?.pid, process.pid);
+  });
+
+  // On Windows the process cwd is read out of the PEB `CurrentDirectory`, which
+  // always carries a trailing separator (`D:\proj\`) while projectDir never
+  // does. Without normalizing it away the same-project comparison can never
+  // match, killPid returns 'unverified', and every restart aborts with
+  // "refusing to start: existing MCP server PID could not be verified".
+  // The command line here is just `node .../cli.js`, so the
+  // commandContainsProjectPath fallback cannot rescue the comparison either.
+  test('verifies a stale PID whose reported cwd carries a trailing separator', () => {
+    writeFileSync(registryPath, JSON.stringify({
+      [tmp]: { pid: 6666, projectDir: tmp, startedAt: '2026-01-01T00:00:00.000Z' },
+    }));
+
+    const signals: Array<{ pid: number; signal: NodeJS.Signals | 0 | undefined }> = [];
+    registerMcpInstance(tmp, registryPath, {
+      kill(pid, signal) {
+        signals.push({ pid, signal });
+      },
+      getProcessCommand() {
+        return 'node /workspace/packages/mcp-server/dist/cli.js';
+      },
+      getProcessCwd() {
+        return `${tmp}${sep}`;
+      },
+      getProcessStartTime() {
+        return Date.parse('2025-12-31T23:59:59.000Z');
+      },
+      waitForExit() {},
+    });
+
+    assert.deepEqual(signals, [
+      { pid: 6666, signal: 0 },
+      { pid: 6666, signal: 'SIGTERM' },
+      { pid: 6666, signal: 0 },
+      { pid: 6666, signal: 'SIGKILL' },
+    ]);
+    assert.equal(readOwnEntry(registryPath, tmp)?.pid, process.pid);
+  });
+
+  // The `\\?\` extended-length prefix and a trailing separator arrive together
+  // from the PEB for a long path, so stripping only one of them still fails.
+  test('verifies a stale PID whose cwd is an extended-length path with a trailing separator', () => {
+    writeFileSync(registryPath, JSON.stringify({
+      [tmp]: { pid: 6667, projectDir: tmp, startedAt: '2026-01-01T00:00:00.000Z' },
+    }));
+
+    const signals: Array<{ pid: number; signal: NodeJS.Signals | 0 | undefined }> = [];
+    registerMcpInstance(tmp, registryPath, {
+      kill(pid, signal) {
+        signals.push({ pid, signal });
+      },
+      getProcessCommand() {
+        return 'node /workspace/packages/mcp-server/dist/cli.js';
+      },
+      getProcessCwd() {
+        return `\\\\?\\${tmp}${sep}`;
+      },
+      getProcessStartTime() {
+        return Date.parse('2025-12-31T23:59:59.000Z');
+      },
+      waitForExit() {},
+    });
+
+    assert.equal(
+      signals.some((entry) => entry.signal === 'SIGTERM'),
+      true,
+      'extended-length cwd with a trailing separator must still verify as the same project',
+    );
+    assert.equal(readOwnEntry(registryPath, tmp)?.pid, process.pid);
+  });
+
+  // A drive root ("D:\") and the POSIX root ("/") ARE their trailing separator.
+  // Stripping it would turn them into "D:" / "" and match the wrong directory,
+  // so a project at the root must stay verifiable.
+  test('does not strip the separator that constitutes a root path', () => {
+    const rootDir = process.platform === 'win32' ? `${tmp.slice(0, 2)}${sep}` : sep;
+
+    writeFileSync(registryPath, JSON.stringify({
+      [rootDir]: { pid: 6668, projectDir: rootDir, startedAt: '2026-01-01T00:00:00.000Z' },
+    }));
+
+    const signals: Array<{ pid: number; signal: NodeJS.Signals | 0 | undefined }> = [];
+    registerMcpInstance(rootDir, registryPath, {
+      kill(pid, signal) {
+        signals.push({ pid, signal });
+      },
+      getProcessCommand() {
+        return 'node /workspace/packages/mcp-server/dist/cli.js';
+      },
+      getProcessCwd() {
+        return rootDir;
+      },
+      getProcessStartTime() {
+        return Date.parse('2025-12-31T23:59:59.000Z');
+      },
+      waitForExit() {},
+    });
+
+    assert.equal(
+      signals.some((entry) => entry.signal === 'SIGTERM'),
+      true,
+      'a root project directory must still verify against its own cwd',
+    );
+  });
+});
+
+describe('defaultGetProcessCwd', () => {
+  // The Windows cwd probe assigned the target pid to `$pid`, which is a
+  // READ-ONLY PowerShell automatic variable. The assignment raised
+  // "Cannot overwrite variable PID because it is read-only or constant",
+  // that error was swallowed by stdio: ['ignore','pipe','ignore'], and `$pid`
+  // kept PowerShell's own pid — so the probe reported the WRONG process's cwd.
+  test('reads the cwd of the target process, not of the probe itself', { skip: process.platform !== 'win32' }, async () => {
+    const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+      cwd: tmp,
+      stdio: 'ignore',
+    });
+    const exited = once(child, 'exit');
+
+    try {
+      assert.ok(child.pid, 'child process must have a pid');
+      const cwd = defaultGetProcessCwd(child.pid);
+      assert.notEqual(cwd, null, 'probe must resolve a cwd for a live child process');
+      assert.equal(normPath(realpathSync(cwd!)), normPath(realpathSync(tmp)));
+    } finally {
+      // Await the exit before returning: while the child lives, tmp is its
+      // working directory and Windows refuses afterEach's rmSync with EPERM.
+      child.kill('SIGKILL');
+      await exited;
+    }
   });
 });
 
