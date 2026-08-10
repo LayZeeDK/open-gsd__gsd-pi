@@ -512,21 +512,76 @@ const KNOWN_COMMAND_PREFIXES = new Set([
  */
 const PROSE_MARKER_WORDS = new Set([
   "an", "the", "is", "are", "was", "were", "should", "shows", "showing",
-  "returns", "contains", "confirms", "exists", "piped", "authored",
+  "returns", "contains", "confirms", "exists", "exits", "piped", "authored",
   "that", "which", "whether", "there", "its", "their",
 ]);
 
+/** Is this token a prose marker, ignoring trailing sentence punctuation? */
+function isProseMarker(token: string): boolean {
+  return PROSE_MARKER_WORDS.has(token.toLowerCase().replace(/[.,;:!?]+$/, ""));
+}
+
+/**
+ * A bare English word or number — nothing an operand would carry. No path
+ * separator, dot, quote, uppercase letter or other shell-ish punctuation, which
+ * is what keeps `README.md`, `packages/core/src` and `"the"` out.
+ */
+function isBareEnglishWord(token: string): boolean {
+  const bare = token.replace(/[.,;:!?]+$/, "");
+
+  return /^[a-z]+$/.test(bare) || /^[0-9]+$/.test(bare);
+}
+
 /**
  * Does a known-command-prefixed string read as prose rather than a command?
- * True when there is no flag/sub-command structure but there are English
- * function words — e.g. "git log shows the scaffold commit authored by ...".
+ * True when English function words appear where operands should — e.g.
+ * "git log shows the scaffold commit authored by ...".
+ *
+ * A flag no longer disables the check outright. Bailing on
+ * `tokens.some(t => t.startsWith("-"))` meant one flag anywhere disabled prose
+ * detection for the whole line, so `git grep -n "Theming" README.md confirms
+ * the section exists` ran verbatim and false-failed a task that had passed.
+ *
+ * The `tokens.length < 4` guard is load-bearing, not incidental: with it the
+ * no-flags branch is EXACTLY the previous rule rewritten around markerIndex, so
+ * nothing it calls prose today was called a command before. Drop the guard and
+ * that branch genuinely widens — `grep exists f.txt` would flip.
+ *
+ * With flags present the rule is narrower than a bare marker hit: only a
+ * TRAILING RUN of bare English words counts, so a real operand keeps the line
+ * runnable (`git grep -n the README.md` stays a command because `README.md` is
+ * not a bare word) while a description does not.
+ *
+ * Two further conditions on that run, both narrowing, both keeping the
+ * canonical `<check> && echo <marker>` idiom runnable:
+ *
+ *   - A ONE-word run is an operand, not a sentence. Without this,
+ *     `test -f dist/index.js && echo exists` reads as prose — the marker is the
+ *     last token, so the run is the single word `exists` and passes `every`
+ *     vacuously — and a check that used to run is silently skipped.
+ *   - A run introduced by a command word is that command's arguments, so
+ *     `... && echo the build exists` stays runnable too.
+ *
+ * Known trade-off: an unquoted marker word inside a trailing run of bare-word
+ * operands (`git grep -n the`, `grep -rn contains src`) reads as prose and is
+ * skipped rather than run. A quoted marker or one carrying a path separator,
+ * dot or uppercase is unaffected. Skipping is the fail-safe direction — a
+ * skipped check reports as unverified, an executed sentence fails a task that
+ * succeeded.
  */
 function readsAsProseAfterCommandWord(tokens: string[]): boolean {
   if (tokens.length < 4) return false;
-  if (tokens.some(t => t.startsWith("-"))) return false;
-  return tokens
-    .slice(1)
-    .some(t => PROSE_MARKER_WORDS.has(t.toLowerCase().replace(/[.,;:!?]+$/, "")));
+
+  const markerIndex = tokens.findIndex((token, index) => index > 0 && isProseMarker(token));
+  if (markerIndex === -1) return false;
+
+  if (!tokens.some(t => t.startsWith("-"))) return true;
+
+  const proseRun = tokens.slice(markerIndex);
+  if (proseRun.length < 2) return false;
+  if (KNOWN_COMMAND_PREFIXES.has(tokens[markerIndex - 1])) return false;
+
+  return proseRun.every(isBareEnglishWord);
 }
 
 /**

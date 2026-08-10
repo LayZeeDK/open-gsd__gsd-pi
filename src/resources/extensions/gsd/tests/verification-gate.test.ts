@@ -857,6 +857,43 @@ test("isLikelyCommand: known command word followed by English prose is rejected 
   assert.equal(isLikelyCommand("npm run test:unit"), true);
 });
 
+test("isLikelyCommand: a prose suffix after a flagged command is rejected", () => {
+  // Two independent holes let these run verbatim and false-fail a task whose
+  // substance had passed. The first: readsAsProseAfterCommandWord bailed out as
+  // soon as ANY token began with `-`, so a flag anywhere disabled prose
+  // detection entirely. The second: `exits` was absent from PROSE_MARKER_WORDS
+  // (only `exists` was there), so a flagless line found no marker at all.
+  assert.equal(isLikelyCommand('git grep -n "Theming" README.md confirms the section exists'), false);
+  assert.equal(isLikelyCommand("nx test mypkg exits 0"), false);
+});
+
+test("isLikelyCommand: a real operand after a flag keeps the line a command", () => {
+  // The counterweight to the test above: rejecting a trailing run of bare
+  // English words must not reject a legitimate operand. `README.md` is not a
+  // bare word, and a quoted marker is a search pattern rather than prose.
+  assert.equal(isLikelyCommand("git grep -n the README.md"), true);
+  assert.equal(isLikelyCommand('git grep -n "the" README.md'), true);
+  assert.equal(isLikelyCommand("git grep -n exits packages/core/src"), true);
+});
+
+test("isLikelyCommand: a marker as the last shell segment's operand stays a command", () => {
+  // `<check> && echo <marker>` is the canonical verify idiom, and the marker is
+  // echo's ARGUMENT. Judging the trailing run without these guards made the run
+  // the single word `exists`, which passes `every(isBareEnglishWord)` vacuously,
+  // so lines that used to run were silently skipped as unverified.
+  assert.equal(isLikelyCommand("test -f dist/index.js && echo exists"), true);
+  assert.equal(isLikelyCommand('grep -q "foo" out.txt && echo exists'), true);
+  assert.equal(isLikelyCommand("test -d .gsd && echo there"), true);
+  // A multi-word run still stays a command when a command word introduces it.
+  assert.equal(isLikelyCommand("test -f dist/index.js && echo the build exists"), true);
+  // The counterweight: a prose suffix after a real operand is still prose, and
+  // a shell operator earlier in the line does not excuse it.
+  assert.equal(
+    isLikelyCommand('npm run build && git grep -n "Theming" README.md confirms the section exists'),
+    false,
+  );
+});
+
 test("isLikelyCommand: prose markers exclude operand-shaped words", () => {
   // Bare prepositions and single letters are plausible operands, so they must
   // not flip a flagless command to prose.
