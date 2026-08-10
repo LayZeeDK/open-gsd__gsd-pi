@@ -20,6 +20,12 @@ import {
 } from "@gsd/native/file-identity";
 
 import { withProjectionMutationSync } from "./database-maintenance-fence.js";
+import {
+  externalStateProjectRoot,
+  isExternalStateStore,
+  isSameFilesystemPath,
+} from "./external-state-store.js";
+import { gsdHome } from "./gsd-home.js";
 import { gsdProjectionRoot } from "./paths.js";
 import { classifyGsdLogicalPath } from "./projection-path-policy.js";
 
@@ -2122,16 +2128,35 @@ function managedProjectionTarget(filePath: string): { targetRoot: string; logica
   while (current !== dirname(current)) {
     if (basename(current).toLocaleLowerCase("en-US") === ".gsd") {
       if (!existsSync(join(current, "gsd.db"))) return null;
+      // The GLOBAL gsd home is named ".gsd" too, but it is not a project's
+      // projection root -- its parent is the user profile, which can never be
+      // locked exclusively on Windows (OS error 32, deterministically: the
+      // profile always has open handles).
+      if (isSameFilesystemPath(current, gsdHome())) return null;
       const targetRoot = dirname(current);
       const logicalPath = logicalProjectionPath(targetRoot, filePath);
       return classifyGsdLogicalPath(logicalPath) === "managed"
         ? { targetRoot, logicalPath }
         : null;
     }
+    if (isExternalStateStore(current)) {
+      // Hard boundary: a store is never climbed past. Continuing upward is what
+      // reaches the global ~/.gsd and takes the user profile as targetRoot,
+      // where acquireProjectionRootIdentityLock fails with OS error 32.
+      const externalRoot = externalStateProjectRoot(current);
+      if (externalRoot === null) return null;
+      const logicalPath = logicalProjectionPath(externalRoot, filePath);
+      return classifyGsdLogicalPath(logicalPath) === "managed"
+        ? { targetRoot: externalRoot, logicalPath }
+        : null;
+    }
     current = dirname(current);
   }
   return null;
 }
+
+/** Test seam: managedProjectionTarget decides the projection root to lock. */
+export const managedProjectionTargetForTest = managedProjectionTarget;
 
 export function beginManagedProjectionMutation(
   filePath: string,
@@ -2264,6 +2289,11 @@ function createInitialProjectionDirectory(directoryPath: string): boolean {
     projectionRoot = dirname(projectionRoot);
   }
   if (basename(projectionRoot).toLocaleLowerCase("en-US") !== ".gsd") return false;
+  // Safety net: the GLOBAL gsd home is not a project projection root. Its
+  // parent is the user profile, and an exclusive lock on the profile can never
+  // be acquired on Windows. Returning false degrades to the plain recursive
+  // mkdir in createProjectionDirectorySync instead of throwing.
+  if (isSameFilesystemPath(projectionRoot, gsdHome())) return false;
   const targetRoot = dirname(projectionRoot);
   if (!isProjectionRootIdentityLockAvailable()) {
     // Validate the project root before mkdir-ing under it, mirroring the

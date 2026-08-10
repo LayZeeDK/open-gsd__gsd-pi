@@ -14,6 +14,7 @@ import {
 import { basename, dirname, join, resolve } from "node:path";
 
 import { GSDError, GSD_STALE_STATE } from "./errors.js";
+import { isExternalStateStore } from "./external-state-store.js";
 import { getDatabaseReplacementPaths } from "./database-replacement-paths.js";
 import { processStartIdentity } from "./process-start-identity.js";
 import { syncDirectoryEntry } from "@gsd/native/directory-sync";
@@ -420,10 +421,22 @@ function projectionDatabasePath(filePath: string): string | null {
       const gsdPath = join(dirname(current), ".gsd");
       return pathExistsFailClosed(gsdPath) ? join(gsdPath, "gsd.db") : null;
     }
+    if (isExternalStateStore(current)) {
+      // Same hard boundary as managedProjectionTarget. Without it the walk
+      // escapes to the global ~/.gsd and hands back <gsdHome>/gsd.db as the
+      // fence key: the maintenance/replacement fence then guards the wrong
+      // database -- silently, because this path never throws -- and every
+      // external-state project on the machine shares a single claim key.
+      const databasePath = join(current, "gsd.db");
+      return pathExistsFailClosed(databasePath) ? databasePath : null;
+    }
     current = dirname(current);
   }
   return null;
 }
+
+/** Test seam: projectionDatabasePath decides which database the fence guards. */
+export const projectionDatabasePathForTest = projectionDatabasePath;
 
 export function withProjectionMutationSync<T>(filePath: string, operation: () => T): T {
   const databasePath = projectionDatabasePath(filePath);
