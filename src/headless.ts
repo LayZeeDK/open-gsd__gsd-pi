@@ -22,6 +22,7 @@ import { SessionManager } from '@gsd/pi-coding-agent'
 import type { SessionInfo } from '@gsd/pi-coding-agent'
 import { getProjectSessionsDir } from './project-sessions.js'
 import { loadAndValidateAnswerFile, AnswerInjector } from './headless-answers.js'
+import { unsupportedHeadlessDoctorArgs } from './headless-doctor-args.js'
 
 import {
   isTerminalNotification,
@@ -424,6 +425,21 @@ async function runHeadlessOnce(options: HeadlessOptions, restartCount: number): 
   // path lets non-interactive callers (CI, recovery scripts, the live-regression
   // suite) get the same diagnostic without a TTY.
   if (options.command === 'doctor') {
+    // Refuse arguments this entrypoint cannot honour rather than dropping them.
+    // BREAKING: the branch previously exited `report.ok ? 0 : 1` regardless of
+    // extra args, so `gsd headless doctor fix` on a healthy repo exited 0 while
+    // honouring nothing. Callers that want the scan drop the extra args; there
+    // is deliberately no second exit code for "refused", which would just
+    // re-hide the misuse this exists to surface.
+    const unsupported = unsupportedHeadlessDoctorArgs(options.commandArgs)
+    if (unsupported.length > 0) {
+      process.stderr.write(
+        `[headless] Error: gsd headless doctor does not support '${unsupported.join(' ')}'. `
+        + 'It is a read-only diagnostic; only --json is accepted.\n'
+        + 'Use the interactive /gsd doctor for fix / heal / audit / resolve-evidence.\n',
+      )
+      process.exit(EXIT_ERROR)
+    }
     const wantsJson = options.json || options.commandArgs.includes('--json')
     const { runGSDDoctor } = await import('./resources/extensions/gsd/doctor.js')
     const { formatDoctorReport, formatDoctorReportJson } = await import('./resources/extensions/gsd/doctor-format.js')
