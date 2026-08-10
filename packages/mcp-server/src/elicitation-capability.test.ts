@@ -30,6 +30,9 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 
@@ -192,7 +195,16 @@ describe('ask_user_questions elicitation over a raw client connection', () => {
   // A client with no elicitation capability must NOT be handed the request: the
   // refusal is what makes the handler fall through to a configured remote
   // questions channel rather than waiting on a host that cannot ask anything.
-  it('does not send elicitation to a client that advertises none', async () => {
+  //
+  // It is also the one path that reproduces the reported failure, so it doubles
+  // as the end-to-end check that the diagnostic is actually wired in: the
+  // handler swallows the refusal, and without this record nothing would say
+  // which capabilities the server had resolved.
+  it('does not send elicitation to a client that advertises none, and records why', async () => {
+    const gsdHome = mkdtempSync(join(tmpdir(), 'gsd-elicit-wiring-'));
+    const previousHome = process.env['GSD_HOME'];
+    process.env['GSD_HOME'] = gsdHome;
+
     const { client, close } = await connect({ roots: { listChanged: true } }, ACCEPT);
 
     try {
@@ -202,8 +214,24 @@ describe('ask_user_questions elicitation over a raw client connection', () => {
       });
 
       assert.equal(client.elicitations.length, 0, 'a client without elicitation must never receive the request');
+
+      const entries = readFileSync(join(gsdHome, 'diagnostics.jsonl'), 'utf-8')
+        .split('\n')
+        .filter((line) => line.trim() !== '')
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+
+      assert.equal(entries.length, 1, 'the refusal must leave exactly one diagnostic record');
+      assert.deepEqual(
+        entries[0]!['capabilities'],
+        { roots: { listChanged: true } },
+        'the record must carry the capabilities as the SERVER resolved them',
+      );
+      assert.match(String(entries[0]!['error']), /elicitation/i);
     } finally {
       await close();
+      if (previousHome === undefined) delete process.env['GSD_HOME'];
+      else process.env['GSD_HOME'] = previousHome;
+      rmSync(gsdHome, { recursive: true, force: true });
     }
   });
 });

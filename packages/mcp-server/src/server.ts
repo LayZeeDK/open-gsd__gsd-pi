@@ -38,6 +38,7 @@ import {
   validateProjectDir,
   warmWorkflowToolBridges,
 } from './workflow-tools.js';
+import { recordElicitationDiagnostic, type ElicitationDiagnosticServer } from './elicitation-diagnostics.js';
 import { installMoonshotCompatibleToolSchemas } from './moonshot-tool-schema.js';
 import { applySecrets, checkExistingEnvKeys, detectDestination, resolveProjectEnvFilePath } from './env-writer.js';
 
@@ -1330,7 +1331,21 @@ export async function createMcpServer(
     async (args: Record<string, unknown>, extra?: McpToolExtra) => {
       const { questions } = args as unknown as AskUserQuestionsParams;
       return askUserQuestionsHandler(questions, extra, {
-        elicitInput: (params, options) => server.server.elicitInput(params, options),
+        // Record the failure before rethrowing. The handler downgrades an
+        // unreachable host into a fallback or a clean timeout result, which is
+        // right for the caller but leaves no trace of WHY the host was
+        // unreachable -- and the deciding fact, the capabilities as this server
+        // resolved them, is available only here.
+        elicitInput: async (params, options) => {
+          try {
+            return await server.server.elicitInput(params, options);
+          } catch (error) {
+            // The local McpServerInstance type declares only elicitInput; the
+            // underlying SDK Server also exposes the client accessors.
+            recordElicitationDiagnostic(server.server as unknown as ElicitationDiagnosticServer, error);
+            throw error;
+          }
+        },
         isRemoteConfigured,
         tryRemoteQuestions,
       });
