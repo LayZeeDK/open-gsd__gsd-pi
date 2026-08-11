@@ -43,6 +43,10 @@ Full build, link and rebase procedure: **[FORK.md](FORK.md)**.
 | 11 | `da4c30d7` | prose-suffixed `Verify:` lines with a flag | not filed |
 | 12 | `d2f6b378` | `error.cause` in re-wrapped projection failures | not filed |
 | 13 | `358f40db` | headless doctor argument refusal (**breaking**) | not filed |
+| 14 | `9089f9c8` | depth-gate arming paired with a delivery rollback | not filed |
+
+Plus one fork-local dependency decision that is deliberately **not** a
+cherry-pickable patch -- see [The SDK bump](#the-sdk-bump-0283---03227).
 
 One further patch was written and then **withdrawn** -- see
 [Investigated and rejected](#investigated-and-rejected).
@@ -537,6 +541,220 @@ with no doctor report and exit 1, `gsd headless doctor fix` is refused, and
 **Retires** the `gsd-recover-aborted-task` step that has the operator quote the
 subcommand to work around the dropped argv.
 
+### 14. Pair depth-gate arming with a delivery rollback -- `9089f9c8`
+
+**Symptom.** Saving a milestone `CONTEXT` was impossible from a client without
+form elicitation, and the *first* failed attempt bricked the whole session --
+`CONTEXT-DRAFT` too, and all bash. Reported against consumer project
+`ngx-foundation-sites`, milestone `M002`
+([blocker report](docs/dev/2026-08-11-milestone-context-elicitation-gate-blocker.md)).
+
+**Cause.** Not "the wrong error is returned". The gate is armed *before* delivery
+is attempted and nothing rolls it back when delivery fails. With `pendingGateId`
+set, `enforceWorkflowWriteGate` refuses every workflow tool -- including
+`CONTEXT-DRAFT`, which `shouldBlockContextArtifactSaveInSnapshot` otherwise lets
+through on its `artifactType !== "CONTEXT"` line -- and
+`shouldBlockPendingGateBashInSnapshot` refuses all bash. The only tool
+`GATE_SAFE_TOOLS` still permits is `ask_user_questions`, which fails identically.
+That is reproduction step 3.
+
+Worse than a stuck flag: `armPendingGate` deletes `verifiedApprovalGates[gateId]`
+and `verifiedDepthMilestones[milestoneId]`. Revoking on a genuine re-ask is
+intended; revoking on a delivery that never happened leaves state **strictly
+worse than before the call**, silently costing a previously human-verified
+milestone its verification.
+
+**There are two arming sites, not one.** This is the fact that shapes the fix:
+
+| Site | Process |
+| --- | --- |
+| `server.ts` `recordAskUserQuestionsPendingGate` | MCP child |
+| `register-hooks.ts` `tool_execution_start` | extension host -- `UNIVERSAL_TOOL_HOOKS`, so **every** engine |
+
+A child-side fix alone leaves the host arm intact and the session still bricked
+on the claude-code-cli engine path, which is the path in the report.
+
+**Fix, two mechanisms.**
+
+*Capability pre-check (child).* When the client's resolved capabilities lack
+`elicitation.form` **and** no remote channel is configured, return one accurate
+error and arm nothing. Keyed on `elicitation.form` because that is the exact
+field the SDK's own `elicitInput` asserts on
+(`server/index.js`: `if (!this._clientCapabilities?.elicitation?.form) throw`),
+read *after* the `ElicitationCapabilitySchema` preprocess -- reasoning from raw
+initialize params produced a wrong fix once already (see the withdrawn patch).
+
+*Capture-and-restore rollback (both sides).* The load-bearing half.
+`armPendingGateForDelivery` captures what the arm revoked plus the gate it
+displaced; `applyPendingGateRollback` restores all three in **one** mutation, so
+no interleaved reader sees a half-rolled-back state. The child restores in a
+`finally`; the host captures per `toolCallId` and restores at
+`tool_execution_end` on an errored result.
+
+**A `finally`, deliberately not a predicate on the error message.** A predicate
+keyed on the capability wording covers only the one failure mode the pre-check
+already prevents. `server.ts` rethrows past `isLocalElicitFallbackError` for
+transport and serialization failures, and **the remote-configured path is not
+exempt**: it throws with the gate still armed when the remote fallback fails, and
+that throw is not a capability assertion. An expired Discord token -- the exact
+case that code path's comment was written for -- plus a non-elicitation client
+was a full brick.
+
+**Delivered is not the same as answered.** Answered, declined, cancelled, timed
+out, or any remote round all count as delivered and keep the gate armed: those
+are genuine re-asks, and the existing `timed_out` / `cancelled` handling depends
+on it. Only a question that never reached anyone is rolled back.
+
+**Two traps this uncovered.**
+
+- The pre-check returns before `server.server.elicitInput`, which is the only
+  place `recordElicitationDiagnostic` is reached -- so it silently deleted patch
+  8's diagnostics record. `elicitation-capability.test.ts` caught it. The refusal
+  now writes its own entry.
+- `getClientCapabilities()` returning nothing means "not connected / not known",
+  **not** "elicitation absent". Treating the two alike refused every elicitation
+  on an unconnected server, breaking a test that drives the registered tool
+  directly. Only a capability set that *was* resolved and lacks
+  `elicitation.form` is a knowable refusal.
+
+**Deliberately out of scope.** `activateDeferredApprovalGate` (`agent_end`) arms
+for a *future* question rather than around a delivery attempt, so it has no
+delivery to pair with; rolling it back would defeat it. And `secure_env_collect`
+elicits too but has no gate, so it errors rather than deadlocks.
+
+**Tests.** Eight handler cases, three write-gate seam cases, five host cases.
+Proven load-bearing: disabling the host rollback turns two of them red on exactly
+the documented assertion. The seam tests cover the displaced-previous-gate case
+that nothing else reaches, and the host tests pin the deliverable directly --
+after a failed ask, `CONTEXT-DRAFT` and bash work again while `CONTEXT` stays
+refused.
+
+**What this delivers, and what it does not.** Reproduction step 3 disappears:
+authored context is persisted rather than lost, and every other tool keeps
+working. Final `CONTEXT` stays blocked and the milestone parks in
+`needs-discussion` -- nobody confirmed anything, and the rollback must not become
+the bypass. Making final `CONTEXT` reachable *without* elicitation is deferred; a
+local non-elicitation answer channel is what that would take.
+
+**Note on the report's "no documented workaround".** Not quite right:
+`askUserQuestionsHandler` already falls back to the remote-questions channel
+(Discord/Slack/Telegram) when configured, and answering there verifies the gate.
+Undocumented, not absent.
+
+**Rejected on the merits, recorded so it is not re-raised.** The report's second
+suggestion -- a plain-text confirmation phrase passed as a `gsd_summary_save`
+argument. The model fills tool arguments, so that is the model self-approving a
+gate whose entire purpose is that the model cannot approve it.
+
+Also rejected: a self-expiring gate (needs a new field through
+`normalizeWriteGateSnapshot`, `mergeSnapshotIntoState` and both adapters, to fail
+*open* on a timer -- wrong direction for a consent gate); widening
+`GATE_SAFE_TOOLS` (contradicts its documented intent and weakens the gate for
+every client to fix one); a terminal-sounding error with no state change (relies
+on model compliance, which is exactly what a mechanical gate exists not to rely
+on). Deleting `.gsd/runtime/write-gate-state.json` remains the documented
+stopgap; it was already the supported reset.
+
+---
+
+## The SDK bump 0.2.83 -> 0.3.227
+
+Not a patch: a fork-local dependency decision, so it is listed separately and is
+not written to be cherry-picked. Commit `d603c456`.
+
+**This closes the open question below** under *Investigated and rejected -- Flat
+elicitation capability*: "something produced the error, re-measure the next time
+it reproduces." It reproduced, and this is the cause.
+
+`package.json` pinned `@anthropic-ai/claude-agent-sdk` at exactly `0.2.83`. The
+CLI bundled in that release (claude-code **2.1.83**) builds its MCP client as
+`{capabilities:{roots:{}, ...j ? {elicitation:{form:{},url:{}}} : {}}}` where
+`j = m8("tengu_mcp_elicitation", !1)` -- a client feature flag defaulting to
+**off**. It therefore advertises `{"roots":{}}` verbatim, which is exactly what
+patch 8's diagnostics recorded four times:
+
+```
+{"kind":"elicitation-failed","error":"Client does not support form elicitation.",
+ "capabilities":{"roots":{}},"clientInfo":{"name":"claude-code","version":"2.1.83"}}
+```
+
+**Measured on the wire, not inferred.** The bundled 2.1.227 binary's capability
+factory reads `{roots:{listChanged:!0}, elicitation:{}, ...}` -- unconditional;
+the flag name survives only in the `tengu_mcp_elicitation_shown` /
+`_response` telemetry events. Confirmed against a stub MCP server that records
+the `initialize` params it is sent, driven by `claude mcp list` (a health check,
+so no model and no tokens):
+
+| | advertised capabilities | client version |
+| --- | --- | --- |
+| before | `{"roots":{}}` | 2.1.83 |
+| after | `{"roots":{"listChanged":true},"elicitation":{}}` | 2.1.227 |
+
+`elicitation: {}` is the flat shape the MCP SDK's `ElicitationCapabilitySchema`
+preprocess upgrades to `{ form: {} }`, which `elicitation-capability.test.ts`
+already pins end-to-end over a real transport with real negotiation.
+
+**Peer floors.** `@anthropic-ai/sdk` to `^0.93.0` (the SDK peers `>=0.93.0`) and
+`@modelcontextprotocol/sdk` to `^1.29.0`. Each workspace package declares its own
+range, so `packages/mcp-server` -- the package that actually elicits -- and
+`packages/cloud-mcp-gateway` were raised too; bumping only the root leaves the
+floor unraised where it matters. `packages/pi-ai` and `packages/daemon` keep their
+own `@anthropic-ai/sdk` pins: neither imports the agent SDK, and nothing under
+the root `src/` imports `@anthropic-ai/sdk` at all.
+
+**The packaging change, and the Windows path it broke.** 0.3.x no longer ships
+`cli.js` in the main package -- the CLI moved to platform
+`optionalDependencies`. That deletes the file `resolveBundledClaudeCliPath()`
+looked for, and the whole PATH-lookup block in `stream-adapter.ts` existed only
+because the SDK treats a non-`.js` path as a native binary and chokes on npm
+`.cmd` shims, with `cli.js` as the Windows escape hatch. With no `cli.js` left to
+normalize onto, the block is gone and `pathToClaudeCodeExecutable` is no longer
+passed: the SDK resolves its own version-locked binary when the option is
+omitted, and throws `Native CLI binary for <platform>-<arch> not found. Reinstall
+@anthropic-ai/claude-agent-sdk without --omit=optional, or set
+options.pathToClaudeCodeExecutable.` otherwise.
+
+`readiness.ts` is untouched and must stay -- probing the PATH `claude` for install
+and auth state is a separate question from which binary the SDK executes. The
+`cli.js` reference in `referencesClaudeCodeExecutable` also stays: it feeds
+`findConcurrentClaudeCodeProcesses`, which detects *other* Claude Code processes,
+and bumping this repo's SDK does not stop 0.2.x-based tools from spawning
+`cli.js`.
+
+**Three consequences, stated rather than buried.**
+
+- **Which binary runs changes**, from the user's PATH install to the bundled
+  version-locked one. This is what makes the elicitation fix deterministic --
+  otherwise whether the bug is fixed depends on the user's PATH `claude`. Auth is
+  unaffected; it comes from `~/.claude` credentials, not the binary.
+- **`--omit=optional` installs lose their fallback.** They previously degraded to
+  `claude.cmd` from PATH; now they get the SDK's error. Keeping `getClaudePath()`
+  as a *fallback* (bundled first, PATH second) is the alternative if that ever
+  becomes unacceptable.
+- **The platform package is not a this-host-only cost.** It is a transitive
+  optional dependency of the SDK, so the matching build (~90 MB packed /
+  ~274 MB unpacked; here `claude.exe` at 287 MB) also lands on every linux-x64 CI
+  runner and inside the Docker image, whether or not
+  `pathToClaudeCodeExecutable` was ever passed.
+
+**Typed API risk measured, not assumed.** `buildSdkOptions` returns
+`Record<string, unknown>`, so a renamed or dropped option fails **silently** --
+the unit tests assert on the object gsd-pi *builds*, not on what the SDK
+consumes, and no existing check covers it. Diffing the `query` `Options` type
+across the two releases: **0 keys removed**, 14 added (`toolAliases`,
+`onUserDialog`, `supportedDialogKinds`, `sessionStore`, `sessionStoreFlush`,
+`loadTimeoutMs`, `includeHookEvents`, `forwardSubagentText`, `taskBudget`,
+`planModeInstructions`, `resumeDropsTurn`, `managedSettings`, `skills`, `title`),
+and all 28 keys `buildSdkOptions` sets are still present. Re-run this diff at
+every SDK bump.
+
+**Installing on this host.** `pnpm install` aborts on the `@opengsd/gsd-browser`
+postinstall, so use `--ignore-scripts` and then re-run
+`node scripts/link-workspace-packages.cjs` -- see
+[FORK.md](FORK.md#the-claude-agent-sdk-bump). `--ignore-scripts` does not affect
+the platform binary: the SDK packages declare no `scripts` and the platform
+packages are pure payload.
+
 ## Review pass
 
 A review over every patch on the branch raised eight findings. Six were real and
@@ -637,12 +855,26 @@ wrong reason:
 - The probe's `hasElicitationForm: false` was read from **raw** initialize
   params, before schema parsing. It does not show what the SDK server concluded.
 
-**What is still unexplained.** The error itself was real, so something produced
-it. The preprocess only rewrites an *empty* object, so a client advertising a
-non-empty elicitation capability without `form` (say `{ url: {} }`) would still
-be refused. No client is known to do that, and guessing at a workaround is what
-produced the withdrawn patch. Re-measure `getClientCapabilities()` **as the
-server sees it** -- not the raw params -- the next time it reproduces.
+**ANSWERED -- what produced the error.** It reproduced on 2026-08-11 and patch
+8's diagnostics named the cause on the first look: the client advertised
+`{"roots":{}}`, i.e. **no elicitation capability at all**, not a non-empty one
+missing `form`. The `tengu_mcp_elicitation` client feature flag in claude-code
+2.1.83 defaults to off, so the preprocess had nothing to upgrade -- it only
+rewrites an *empty* elicitation object, and there was no elicitation key. Fixed
+by [the SDK bump](#the-sdk-bump-0283---03227); patch 14 is what makes the failure
+recoverable for any client that still cannot elicit.
+
+So the hypothesis was wrong in a specific, useful way: the shape was not
+`elicitation: {}` (which works fine), it was *absent*. The probe that recorded
+`elicitation:{}` was reading its own SDK client's normalized output, not what
+claude-code 2.1.83 sent -- which is the second trap below, and why the raw-params
+reading was misleading in both directions.
+
+Still unmeasured, and left alone: a client advertising a **non-empty** elicitation
+capability without `form` (say `{ url: {} }`) would still be refused, and the
+preprocess does not cover it. No client is known to do that. Patch 14's
+pre-check now reports that case accurately instead of deadlocking on it, which is
+a better answer than a shim.
 
 `elicitation-capability.test.ts` remains as the regression guard: it pins the
 SDK's upgrade behaviour, so if a future SDK drops the preprocess that assertion

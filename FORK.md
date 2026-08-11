@@ -9,6 +9,7 @@ about the mechanics.
 - [Layout](#layout)
 - [How the global `gsd` command is linked](#how-the-global-gsd-command-is-linked)
 - [Rebuilding](#rebuilding)
+- [The Claude Agent SDK bump](#the-claude-agent-sdk-bump)
 - [Rebasing onto a new upstream tag](#rebasing-onto-a-new-upstream-tag)
 - [Expected test failures](#expected-test-failures)
 
@@ -16,7 +17,7 @@ about the mechanics.
 
 | | |
 | --- | --- |
-| Working branch | `LayZeeDK/dev` -- the patches, plus `PATCHES.md` as the last commit |
+| Working branch | `LayZeeDK/dev` -- the patches, one dependency bump, plus the docs as the last commit |
 | Base | an upstream release tag, currently **`v1.14.0`** (`aa8789b4`) |
 | Remotes | `origin` = `LayZeeDK/open-gsd__gsd-pi`, `upstream` = `open-gsd/gsd-pi` |
 | `main` | tracks upstream; not where the patches live |
@@ -183,6 +184,101 @@ pnpm run verify:pr        # build:core + typecheck:extensions + test:unit + life
 > [Expected test failures](#expected-test-failures) -- treat it as a comparison
 > against a measured baseline, not a pass/fail gate.
 
+## The Claude Agent SDK bump
+
+This branch pins `@anthropic-ai/claude-agent-sdk` at **`0.3.227`**, up from
+upstream's exact `0.2.83`. Why, and the measurements behind it, are in
+[PATCHES.md](PATCHES.md#the-sdk-bump-0283---03227). The mechanics that affect
+day-to-day work here:
+
+### Installing
+
+`pnpm install` aborts on the `@opengsd/gsd-browser` postinstall
+(`unsupported platform win32-arm64`) *before* it repairs anything, so:
+
+```bash
+pnpm install --ignore-scripts
+node scripts/link-workspace-packages.cjs
+```
+
+`--ignore-scripts` is the shape `verify:fast` already uses, and it does not
+affect the platform binary -- the SDK packages declare no `scripts` and the
+platform packages are pure payload.
+
+Validate the lockfile the way CI does before pushing, with the regenerated
+lockfile staged:
+
+```bash
+pnpm install --frozen-lockfile --ignore-scripts
+```
+
+`.github/workflows/ci.yml` uses `--frozen-lockfile` in four jobs and `verify:fast`
+uses it too. A plain install *regenerates* rather than validates, so a stale or
+unstaged lockfile passes locally and then fails every CI job with
+`ERR_PNPM_OUTDATED_LOCKFILE`.
+
+### The install got much bigger, everywhere
+
+0.3.x ships no `cli.js`. The CLI is a platform `optionalDependency` -- on this
+host `@anthropic-ai/claude-agent-sdk-win32-arm64`, whose `claude.exe` is **287
+MB** on disk. An arm64 build exists, unlike `@opengsd/gsd-browser`.
+
+**This is not a this-host-only cost.** The platform package is a transitive
+optional dependency, so the matching linux-x64 build also lands on every CI
+runner and inside the Docker image (`Dockerfile`), regardless of whether
+`pathToClaudeCodeExecutable` is passed.
+
+### Which `claude` binary actually runs
+
+The SDK's own, version-locked -- **not** the one on your PATH. `stream-adapter.ts`
+no longer passes `pathToClaudeCodeExecutable`; the SDK resolves the platform
+package itself. That is deliberate: it is what makes elicitation behaviour
+deterministic instead of a function of whatever `claude` version the developer
+happens to have installed.
+
+Two things follow:
+
+- **`--omit=optional` installs have no fallback.** They used to degrade to
+  `claude.cmd` from PATH; now they get
+  `Native CLI binary for <platform>-<arch> not found. Reinstall
+  @anthropic-ai/claude-agent-sdk without --omit=optional, or set
+  options.pathToClaudeCodeExecutable.`
+- **`readiness.ts` is still about your PATH `claude`**, and that is correct --
+  install and auth state is a separate question from which binary the SDK
+  executes. Do not "fix" the apparent inconsistency.
+
+Auth is unaffected either way: it comes from `~/.claude` credentials, not the
+binary.
+
+### Re-run the options diff at every SDK bump
+
+`buildSdkOptions` returns `Record<string, unknown>`, so a renamed or dropped
+`query` option fails **silently** -- the unit tests assert on the object gsd-pi
+*builds*, not on what the SDK consumes, and nothing else covers it. At 0.3.227 the
+result was 0 keys removed, 14 added, all 28 keys gsd-pi sets still present. Diff
+the `Options` type in `node_modules/@anthropic-ai/claude-agent-sdk/sdk.d.ts`
+against the keys `buildSdkOptions` sets, and record the result in the commit
+message.
+
+### Verifying the client advertises elicitation
+
+The whole point of the bump. Measure it on the wire rather than trusting the
+version number, and never by asserting the *absence* of a new
+`elicitation-failed` line in `~/.gsd/diagnostics.jsonl` -- that is also what a
+silently-failed bump looks like.
+
+Point a stub stdio MCP server that records the `initialize` params it receives at
+an isolated `CLAUDE_CONFIG_DIR`, then run `claude mcp list`: the health check
+performs a real handshake with no model and no tokens. Expect
+
+```json
+{"protocolVersion":"2025-11-25",
+ "capabilities":{"roots":{"listChanged":true},"elicitation":{}},
+ "clientInfo":{"name":"claude-code","version":"2.1.227", ...}}
+```
+
+Under 0.2.83 the same probe yields `{"roots":{}}` -- no elicitation key at all.
+
 ## Rebasing onto a new upstream tag
 
 Patches are written to be cherry-pickable, so a rebase is the normal way to move
@@ -227,9 +323,15 @@ forcing the old diff back in. Three outcomes, all normal:
 - **Restructured** -- the defect moved. Follow it; the test tells you when you
   have it right.
 
-Known churn to expect at the next rebase: **patch 12** touches
-`task-completion-compatibility-adapter.ts`, which upstream has already changed
-past `v1.14.0` (`63254779`, `2e4ca77f`, `3037a37c`).
+Known churn to expect at the next rebase:
+
+- **Patch 12** touches `task-completion-compatibility-adapter.ts`, which upstream
+  has already changed past `v1.14.0` (`63254779`, `2e4ca77f`, `3037a37c`).
+- **The SDK bump is not a patch and does not rebase like one.** If the new
+  upstream tag already pins a `0.3.x` agent SDK, drop the bump commit and keep
+  only whatever `stream-adapter.ts` change is still needed; if upstream is still
+  on `0.2.x`, re-derive the version rather than replaying the old
+  `pnpm-lock.yaml` diff. Re-run the options diff either way.
 
 To drop a commit during the rebase, `git rebase --skip`. To drop one afterwards:
 
@@ -265,8 +367,21 @@ node --import ./src/resources/extensions/gsd/tests/resolve-ts.mjs \
      src/resources/extensions/gsd/tests/doctor-scope-db-unavailable.test.ts \
      src/resources/extensions/gsd/tests/task-completion-compatibility-adapter.test.ts \
      src/resources/extensions/gsd/tests/error-utils.test.ts \
+     src/resources/extensions/gsd/tests/register-hooks-gate-rollback.test.ts \
+     src/resources/extensions/gsd/tests/write-gate-seam.test.ts \
      src/tests/headless-doctor-args.test.ts
 ```
+
+Patch 14 also lands cases in `packages/mcp-server/src/mcp-server.test.ts`, which
+that package's own suite runs:
+
+```bash
+pnpm --filter @opengsd/mcp-server run test
+```
+
+> That script runs a **hardcoded** `node --test dist/...` file list in
+> `packages/mcp-server/package.json`. A new test file not added to that list
+> silently never runs, and the command still goes green.
 
 The linked global `gsd` needs nothing after a rebase -- the symlink points at the
 tree, not at a commit -- but it *does* need the rebuild above, or you will be
@@ -292,35 +407,57 @@ Amend the tip commit rather than adding a new one, so the doc stays last.
 This tree carries failures that predate the fork. Baseline them before treating
 a red test as something you broke.
 
-**All counts below measured 2026-08-11 on win32-arm64, at patch 13.**
+**All counts below measured 2026-08-11 on win32-arm64, at patch 14.**
 
-> **The whole-suite counts predate the review pass** ([PATCHES.md](PATCHES.md#review-pass)),
-> which added 10 tests across five suites and changed no pre-existing assertion.
-> Expect the passing column to be 10 higher; the failing column should be
-> unchanged. Re-measure both rows before treating either as current. The 13
-> per-patch acceptance suites were re-run after the pass and stand at **245 of
-> 246**, the one failure being the `chmodSync` test named below.
+> The 15 per-patch acceptance suites stand at **265 of 266**, the one failure
+> being the `chmodSync` test named below. `pnpm --filter @opengsd/mcp-server run
+> test` is **250 of 250** (2 skipped).
 
 ### Whole suite (`test:unit`, what `verify:pr` runs)
-
-Measured by reverting the fork's 13 changed files to the base and re-running, so
-the two rows differ only by this branch's patches:
 
 | tree | passed | failed | skipped |
 | --- | --- | --- | --- |
 | base `32d2528c`, fork files reverted | 2905 | **1124** | 13 |
-| `LayZeeDK/dev` at patch 13 | 2922 | **1120** | 13 |
+| `LayZeeDK/dev` at patch 13, source reverted | 2924 | **1120** | 13 |
+| `LayZeeDK/dev` at patch 14 + the SDK bump | 2924 | **1121** | 13 |
 
-The fork is **+17 passing, -4 failing**: it regresses nothing and repairs four
-pre-existing failures. **`verify:pr` therefore cannot be used as a pass/fail
-gate on this host** -- it was already failing 1124 before any fork patch existed.
-Compare against the baseline row instead, and re-measure the baseline after every
-rebase.
+Rows 2 and 3 were measured on one tree, differing only by reverting patch 14's
+and the SDK bump's source files, so the delta is **+0 passing, +1 failing** and is
+attributed exactly rather than inferred -- diffing the failing-suite lists yields
+one entry, `register-hooks-gate-rollback.test.js`, and nothing repaired.
 
-Most of the 1120 are Windows-host artefacts rather than upstream breakage -- the
-visible ones assert POSIX path separators (`/fake/package/src/a.ts` vs
-`\fake\package\src\a.ts` in `windows-portability.test.js`). They have not been
-triaged; **they are not known to be harmless, only known not to be ours.**
+**That +1 says nothing about the test.** Under `test:unit:compiled` **945 of 963
+suites already fail wholesale** on a single pre-existing loader problem:
+
+```
+ERR_UNSUPPORTED_ESM_URL_SCHEME
+Only URLs with a scheme in: file, data, and node are supported by the default
+ESM loader. On Windows, absolute paths must be valid file:// URLs.
+Received protocol 'd:'
+```
+
+`write-gate.test.js`, untouched by any patch, fails identically. So **every new
+test file adds exactly one failure to this column regardless of its contents**,
+and the column is close to useless for judging new work on this host. Judge new
+tests with the strip-types runner instead -- the same file is 5 of 5 there.
+
+**`verify:pr` cannot be used as a pass/fail gate on this host**: it was already
+failing 1124 before any fork patch existed. Compare against the baseline row, and
+re-measure the baseline after every rebase.
+
+> **A correction worth reading before you trust an inherited row.** This section
+> previously carried a projection -- "expect the passing column to be 10 higher"
+> after the review pass, i.e. ~2932 -- that was never measured. The measured value
+> is **2924**. Chasing the 8-test discrepancy against a number nobody had checked
+> cost real time. This is the same trap as patch 9's cautionary tale, one level
+> up: **do not record a projected baseline, and do not treat an un-remeasured one
+> as fact.** Measure both rows on one tree, in one sitting, or record nothing.
+
+The 1121 are mostly Windows-host artefacts rather than upstream breakage -- the
+loader failure above, plus assertions on POSIX path separators
+(`/fake/package/src/a.ts` vs `\fake\package\src\a.ts` in
+`windows-portability.test.js`). They have not been triaged; **they are not known
+to be harmless, only known not to be ours.**
 
 ### Path and projection suites
 
