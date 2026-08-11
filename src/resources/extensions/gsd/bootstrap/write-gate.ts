@@ -570,12 +570,86 @@ export function setPendingGate(gateId: string, basePath: string): boolean {
   return defaultWriteGateAdapter().setPending(gateId, basePath);
 }
 
+/**
+ * Ambient export for the child's dynamic-import surface — the arm half of the
+ * arm/deliver/rollback pair. See markDepthVerified for why this is env-sniffed
+ * and why host-owned modules must go through hostWriteGateAdapter instead.
+ */
+export function setPendingGateForDelivery(gateId: string, basePath: string): PendingGateArm | null {
+  return armPendingGateForDelivery(defaultWriteGateAdapter(), gateId, basePath);
+}
+
+/** Ambient export for the child's dynamic-import surface — see setPendingGateForDelivery. */
+export function rollbackPendingGateArm(arm: PendingGateArm): void {
+  defaultWriteGateAdapter().rollbackArm(arm);
+}
+
 /** Arm `gateId` on a reconciled state, revoking its prior verification. */
 function armPendingGate(state: InMemoryWriteGateState, gateId: string): void {
   state.pendingGateId = gateId;
   state.verifiedApprovalGates.delete(gateId);
   const milestoneId = extractDepthVerificationMilestoneId(gateId);
   if (milestoneId) state.verifiedDepthMilestones.delete(milestoneId);
+}
+
+/**
+ * What an arm changed, so a delivery that never reached the user can be undone.
+ *
+ * Arming is only legitimate as one half of a pair: the question has to actually
+ * reach a human. When delivery fails — the client advertises no elicitation
+ * capability, the transport drops, the remote channel's token expired — an
+ * unpaired arm leaves the session strictly worse than before the call. Every
+ * workflow tool is refused (`shouldBlockPendingGate*`), the only permitted tool
+ * is the `ask_user_questions` that just failed, and a milestone a human HAD
+ * verified silently loses that verification.
+ */
+export interface PendingGateArm {
+  gateId: string;
+  basePath: string;
+  /** The gate this arm displaced, restored verbatim on rollback. */
+  previousPendingGateId: string | null;
+  /** `gateId` was in `verifiedApprovalGates` before the arm revoked it. */
+  restoreApprovalGate: boolean;
+  /** Milestone whose depth verification the arm revoked, if any. */
+  restoreDepthMilestoneId: string | null;
+}
+
+/**
+ * Arm `gateId` for one delivery attempt, capturing what the arm revoked.
+ *
+ * Returns null when the adapter's policy suppressed the arm (host:
+ * verified-on-disk wins) — nothing changed, so there is nothing to undo.
+ */
+export function armPendingGateForDelivery(
+  adapter: WriteGateStateAdapter,
+  gateId: string,
+  basePath: string,
+): PendingGateArm | null {
+  const before = adapter.readState(basePath);
+  if (!adapter.setPending(gateId, basePath)) return null;
+
+  const milestoneId = extractDepthVerificationMilestoneId(gateId);
+
+  return {
+    gateId,
+    basePath,
+    previousPendingGateId: before.pendingGateId,
+    restoreApprovalGate: isApprovalGateVerifiedInSnapshot(before, gateId),
+    restoreDepthMilestoneId: milestoneId && isMilestoneDepthVerifiedInSnapshot(before, milestoneId)
+      ? milestoneId
+      : null,
+  };
+}
+
+/**
+ * Restore a captured arm. One mutation, not three: the pending slot and both
+ * verification sets have to move together or an interleaved reader sees a
+ * half-rolled-back state.
+ */
+function applyPendingGateRollback(state: InMemoryWriteGateState, arm: PendingGateArm): void {
+  state.pendingGateId = arm.previousPendingGateId;
+  if (arm.restoreApprovalGate) state.verifiedApprovalGates.add(arm.gateId);
+  if (arm.restoreDepthMilestoneId) state.verifiedDepthMilestones.add(arm.restoreDepthMilestoneId);
 }
 
 /**
@@ -620,6 +694,11 @@ export interface WriteGateStateAdapter {
    */
   setPending(gateId: string, basePath: string): boolean;
   clearPending(basePath: string): void;
+  /**
+   * Undo an arm whose delivery never reached the user. See PendingGateArm;
+   * pair with armPendingGateForDelivery, which produces the record.
+   */
+  rollbackArm(arm: PendingGateArm): void;
 }
 
 /**
@@ -663,6 +742,11 @@ export const hostWriteGateAdapter: WriteGateStateAdapter = {
       state.pendingGateId = null;
     }, { writer: "host" });
   },
+  rollbackArm(arm: PendingGateArm): void {
+    mutateWriteGateState(arm.basePath, (state) => {
+      applyPendingGateRollback(state, arm);
+    }, { writer: "host" });
+  },
 };
 
 /**
@@ -696,6 +780,9 @@ export const childWriteGateAdapter: WriteGateStateAdapter = {
     childMutate(basePath, (state) => {
       state.pendingGateId = null;
     });
+  },
+  rollbackArm(arm: PendingGateArm): void {
+    childMutate(arm.basePath, (state) => applyPendingGateRollback(state, arm));
   },
 };
 

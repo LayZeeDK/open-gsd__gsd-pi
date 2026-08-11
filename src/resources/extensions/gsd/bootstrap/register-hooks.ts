@@ -13,7 +13,7 @@ import type { GSDEcosystemBeforeAgentStartHandler } from "../ecosystem/gsd-exten
 import { updateSnapshot } from "../ecosystem/gsd-extension-api.js";
 
 import { buildMilestoneFileName, canonicalPhaseDirName, clearPathCache, milestonesDir, legacyMilestonesDir, resolveMilestonePath, resolveSliceFile, resolveSlicePath } from "../paths.js";
-import { applyAskUserQuestionsGateResult, clearDiscussionFlowState, currentWriteGateSnapshot, formatPendingAskUserQuestionsGateMessage, formatTimedOutAskUserQuestionsGateMessage, hostWriteGateAdapter, isApprovalGateVerifiedInSnapshot, isDepthConfirmationAnswer, isMilestoneDepthVerifiedInSnapshot, isQueuePhaseActive, resetWriteGateState, shouldBlockContextWrite, shouldBlockPlanningUnit, shouldBlockQueueExecution, shouldBlockWorktreeBash, shouldBlockWorktreeWrite, isGateQuestionId, getPendingGate, shouldBlockPendingGate, shouldBlockPendingGateBash, extractDepthVerificationMilestoneId, type WriteGateSnapshot } from "./write-gate.js";
+import { applyAskUserQuestionsGateResult, armPendingGateForDelivery, clearDiscussionFlowState, currentWriteGateSnapshot, formatPendingAskUserQuestionsGateMessage, formatTimedOutAskUserQuestionsGateMessage, hostWriteGateAdapter, isApprovalGateVerifiedInSnapshot, isDepthConfirmationAnswer, isMilestoneDepthVerifiedInSnapshot, isQueuePhaseActive, resetWriteGateState, shouldBlockContextWrite, shouldBlockPlanningUnit, shouldBlockQueueExecution, shouldBlockWorktreeBash, shouldBlockWorktreeWrite, isGateQuestionId, getPendingGate, shouldBlockPendingGate, shouldBlockPendingGateBash, extractDepthVerificationMilestoneId, type PendingGateArm, type WriteGateSnapshot } from "./write-gate.js";
 import { canonicalToolName } from "../engine-hook-contract.js";
 import { resolveManifest } from "../unit-context-manifest.js";
 import { getIsolationMode, resolveEffectiveUnitIsolationMode } from "../preferences.js";
@@ -193,6 +193,56 @@ function suppressWelcomeHeader(ctx: ExtensionContext): void {
  */
 const deferredApprovalGates = new Map<string, string>();
 const deferredDestructiveConfirmationPauses = new Set<string>();
+
+/**
+ * Host-side arms awaiting their tool result, keyed by toolCallId.
+ *
+ * The host arms at tool_execution_start, before the tool has run, so the arm is
+ * only half a pair: if `ask_user_questions` comes back an error the question
+ * never reached anyone, and an arm left standing refuses every workflow tool
+ * while permitting only the call that just failed. The capture is what lets
+ * tool_execution_end put the state back exactly as it was.
+ *
+ * Bounded by delete-on-end plus a hard cap, because a tool call whose
+ * tool_execution_end never fires would otherwise leak an entry for the lifetime
+ * of the host process.
+ */
+const pendingGateArmsByToolCall = new Map<string, PendingGateArm>();
+const MAX_TRACKED_GATE_ARMS = 32;
+
+/**
+ * Arm for one delivery attempt and remember what the arm revoked.
+ *
+ * A suppressed arm (verified-on-disk wins) records nothing: it changed nothing,
+ * so there is nothing to undo.
+ */
+function trackPendingGateArm(toolCallId: string | undefined, gateId: string, basePath: string): void {
+  const arm = armPendingGateForDelivery(hostWriteGateAdapter, gateId, basePath);
+  if (!arm || typeof toolCallId !== "string") return;
+
+  if (pendingGateArmsByToolCall.size >= MAX_TRACKED_GATE_ARMS) {
+    const oldest = pendingGateArmsByToolCall.keys().next();
+    if (!oldest.done) pendingGateArmsByToolCall.delete(oldest.value);
+  }
+  pendingGateArmsByToolCall.set(toolCallId, arm);
+}
+
+/**
+ * Undo the arm for a tool call whose question never reached the user.
+ *
+ * Called on an errored `ask_user_questions` result. Every error path through the
+ * MCP handler is a failure to deliver — a delivered question that goes
+ * unanswered comes back as a normal result carrying `cancelled` / `timed_out`,
+ * which correctly leaves the gate armed.
+ */
+function rollbackPendingGateArmForToolCall(toolCallId: string | undefined): void {
+  if (typeof toolCallId !== "string") return;
+  const arm = pendingGateArmsByToolCall.get(toolCallId);
+  if (!arm) return;
+
+  pendingGateArmsByToolCall.delete(toolCallId);
+  hostWriteGateAdapter.rollbackArm(arm);
+}
 
 export const MINIMAL_GSD_TOOL_NAMES = [
   "gsd_exec",
@@ -2012,7 +2062,9 @@ export function registerHooks(
         // re-arm in that case. Stale verified state cannot leak into a later
         // re-discussion: a successful handoff deletes the snapshot via
         // clearDiscussionFlowState.
-        hostWriteGateAdapter.setPending(questionId, basePath);
+        // Arming is paired with tool_execution_end below: a question that comes
+        // back an error never reached the user, and the arm is rolled back.
+        trackPendingGateArm(event.toolCallId, questionId, basePath);
         clearDeferredApprovalGate(basePath);
       }
     }
@@ -2040,6 +2092,19 @@ export function registerHooks(
   pi.on("tool_execution_end", async (event) => {
     const toolName = canonicalToolName(event.toolName);
     markToolEnd(event.toolCallId);
+
+    // Close the arm/deliver pair opened at tool_execution_start. An errored
+    // ask_user_questions never reached the user, so the arm it left behind
+    // would refuse every workflow tool while permitting only the call that
+    // just failed — the deadlock the pairing exists to prevent.
+    if (toolName === "ask_user_questions") {
+      if (event.isError) {
+        rollbackPendingGateArmForToolCall(event.toolCallId);
+      } else if (typeof event.toolCallId === "string") {
+        pendingGateArmsByToolCall.delete(event.toolCallId);
+      }
+    }
+
     // #2883/#4974: Capture deterministic invocation/policy errors
     // so postUnitPreVerification can break the retry loop instead of re-dispatching.
     if (event.isError) {

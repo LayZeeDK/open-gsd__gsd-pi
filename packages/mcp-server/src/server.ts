@@ -462,7 +462,43 @@ interface AskUserQuestionsWriteGateModule {
     questions: AskUserQuestion[];
     details: AskUserQuestionsStructuredContent;
   }): unknown;
+  /**
+   * Arm half of the arm/deliver/rollback pair. Optional because the module is
+   * resolved at runtime from the host's compiled output, which may predate it;
+   * without the pair the handler falls back to the unpaired `setPendingGate`.
+   */
+  setPendingGateForDelivery?(gateId: string, basePath: string): PendingGateArmRecord | null;
+  rollbackPendingGateArm?(arm: PendingGateArmRecord): void;
 }
+
+/**
+ * Opaque capture record from the write-gate module. Its fields are the host
+ * module's business; this process only hands it back on rollback.
+ */
+type PendingGateArmRecord = Record<string, unknown>;
+
+/** Gates armed for one `ask_user_questions` delivery attempt. */
+interface ArmedAskUserQuestionsGates {
+  writeGate: AskUserQuestionsWriteGateModule;
+  arms: PendingGateArmRecord[];
+}
+
+/** Whether a channel actually put the question in front of the user. */
+interface AskUserQuestionsDelivery {
+  reached: boolean;
+}
+
+/**
+ * Returned when neither channel can reach the user, in place of arming a gate
+ * that nothing could then satisfy. Names both channels because either one is a
+ * real fix, and says the gate was not armed so the model does not read this as
+ * the pending-gate hard block and stop calling tools.
+ */
+const UNREACHABLE_USER_ERROR =
+  'ask_user_questions cannot reach the user: this client advertises no MCP form-elicitation capability, '
+  + 'and no remote question channel (Discord, Slack, Telegram) is configured. No gate was armed, so every '
+  + 'other tool still works — but a gate question cannot be answered here, and any artifact requiring one '
+  + 'stays blocked. Configure a remote question channel, or use a client that supports MCP form elicitation.';
 
 const OTHER_OPTION_LABEL = 'None of the above';
 
@@ -633,6 +669,19 @@ interface AskUserQuestionsHandlerDeps {
   tryRemoteQuestions(questions: AskUserQuestion[], signal?: AbortSignal): Promise<RemoteToolResult | null>;
   writeGate?: AskUserQuestionsWriteGateModule | null;
   writeGateBasePath?: string;
+  /**
+   * Whether form elicitation can reach this client, judged from the
+   * capabilities as THIS server resolved them (i.e. after the SDK's
+   * `ElicitationCapabilitySchema` preprocess). Optional: when absent the
+   * handler attempts delivery and relies on the rollback instead.
+   */
+  canElicit?(): boolean;
+  /**
+   * Record a refusal that never reached the transport. Without this the A1
+   * pre-check would silently take the diagnostics record away: it returns
+   * before `elicitInput`, which is the only other place the failure is logged.
+   */
+  recordUnreachable?(reason: string): void;
 }
 
 let askUserQuestionsWriteGateModulePromise: Promise<AskUserQuestionsWriteGateModule | null> | null = null;
@@ -685,14 +734,48 @@ async function resolveAskUserQuestionsWriteGate(deps: AskUserQuestionsHandlerDep
 async function recordAskUserQuestionsPendingGate(
   questions: AskUserQuestion[],
   deps: AskUserQuestionsHandlerDeps,
-): Promise<void> {
+): Promise<ArmedAskUserQuestionsGates | null> {
   const writeGate = await resolveAskUserQuestionsWriteGate(deps);
-  if (!writeGate) return;
+  if (!writeGate) return null;
 
   const basePath = askUserQuestionsWriteGateBasePath(deps);
+  const arms: PendingGateArmRecord[] = [];
   for (const question of questions) {
-    if (writeGate.isGateQuestionId(question.id)) {
-      writeGate.setPendingGate(question.id, basePath);
+    if (!writeGate.isGateQuestionId(question.id)) continue;
+
+    if (writeGate.setPendingGateForDelivery && writeGate.rollbackPendingGateArm) {
+      const arm = writeGate.setPendingGateForDelivery(question.id, basePath);
+      if (arm) arms.push(arm);
+      continue;
+    }
+
+    writeGate.setPendingGate(question.id, basePath);
+  }
+
+  return { writeGate, arms };
+}
+
+/**
+ * Undo arms whose question never reached the user.
+ *
+ * Arming revokes prior verification and refuses every workflow tool, so an arm
+ * left standing after a failed delivery is not merely a stale flag: the only
+ * tool the gate still permits is the `ask_user_questions` that just failed, and
+ * a milestone a human had already verified loses that verification. Reverse
+ * order so a displaced `pendingGateId` unwinds the way it was displaced.
+ *
+ * Best-effort by design — this runs in a `finally`, so a throw here would
+ * replace the real error with a rollback error.
+ */
+function rollbackAskUserQuestionsPendingGate(armed: ArmedAskUserQuestionsGates | null): void {
+  const rollback = armed?.writeGate.rollbackPendingGateArm;
+  if (!armed || !rollback) return;
+
+  for (const arm of [...armed.arms].reverse()) {
+    try {
+      rollback.call(armed.writeGate, arm);
+    } catch (err) {
+      console.warn(`[gsd:mcp] ask_user_questions gate rollback failed: ${formatErrorMessage(err)}`);
     }
   }
 }
@@ -797,165 +880,212 @@ export async function askUserQuestionsHandler(
   extra: McpToolExtra | undefined,
   deps: AskUserQuestionsHandlerDeps,
 ): Promise<ToolContent> {
+  const validationError = validateAskUserQuestionsPayload(questions);
+  if (validationError) return errorContent(validationError);
+
+  // A question that can reach nobody must not arm anything. Both channels being
+  // unavailable is knowable before the attempt, so return one accurate error
+  // instead of arming a gate whose only permitted follow-up tool is the
+  // `ask_user_questions` that cannot succeed either. Not sufficient on its own —
+  // a transport failure, a serialization error or an expired remote token all
+  // fail delivery after this point, which is what the rollback covers.
+  if (deps.canElicit && !deps.canElicit() && !deps.isRemoteConfigured()) {
+    deps.recordUnreachable?.(UNREACHABLE_USER_ERROR);
+
+    return errorContent(UNREACHABLE_USER_ERROR);
+  }
+
+  let armed: ArmedAskUserQuestionsGates | null = null;
+  const delivery: AskUserQuestionsDelivery = { reached: false };
+
   try {
-    const validationError = validateAskUserQuestionsPayload(questions);
-    if (validationError) return errorContent(validationError);
-    await recordAskUserQuestionsPendingGate(questions, deps);
+    armed = await recordAskUserQuestionsPendingGate(questions, deps);
+    return await deliverAskUserQuestions(questions, extra, deps, delivery);
+  } catch (err) {
+    return errorContent(err instanceof Error ? err.message : String(err));
+  } finally {
+    if (!delivery.reached) rollbackAskUserQuestionsPendingGate(armed);
+  }
+}
 
-    // Local-first: try the MCP host's elicitation channel (Claude Code,
-    // Cursor, etc.) before any configured remote channel. A misconfigured
-    // remote (e.g. expired Discord token returning 401) must not block the
-    // depth-verification gate when the user is sitting in front of the host.
-    let localElicitError: unknown;
-    let localElicitTimedOut = false;
-    let localElicitCancelledByClient = false;
-    try {
-      const elicitation = await withElicitTimeout(
-        deps.elicitInput(buildAskUserQuestionsElicitRequest(questions), {
-          timeout: ELICIT_TIMEOUT_MS,
-          ...(extra?.signal ? { signal: extra.signal } : {}),
-        }),
-        'ask_user_questions',
-        undefined,
-        extra?.signal,
-      );
-      if (elicitation.action === 'accept' && elicitation.content) {
-        const structured: AskUserQuestionsStructuredContent = {
-          questions,
-          response: buildAskUserQuestionsRoundResult(questions, elicitation),
-          cancelled: false,
-        };
-        await recordAskUserQuestionsGateResult(structured, deps);
-        return {
-          content: [{ type: 'text' as const, text: formatAskUserQuestionsElicitResult(questions, elicitation) }],
-          structuredContent: structured as unknown as Record<string, unknown>,
-        };
-      }
-    } catch (err) {
-      if (!isLocalElicitFallbackError(err)) throw err;
-      localElicitError = err;
-      // A timeout is the host user not answering, not a channel failure.
-      // Returning here (instead of falling through to remote) gives the gate
-      // hook a clean `timed_out` signal so it pauses auto-mode and waits for
-      // the user instead of looping on the blocked call (#852).
-      if (isLocalElicitTimeoutError(err)) {
-        localElicitTimedOut = true;
-      } else if (isLocalElicitClientAbortError(err)) {
-        // The caller aborted the tools/call. Handled below (do not fall
-        // through to remote; the signal is already aborted and no one is
-        // there to answer it either).
-        localElicitCancelledByClient = true;
-      } else {
-        console.warn(`[gsd:mcp] ask_user_questions local elicitation unavailable; trying remote fallback: ${formatErrorMessage(err)}`);
-      }
-    }
-
-    // Host-side timeout: the user is at the host but didn't respond. Do not
-    // fall through to remote (no one is there to answer it either). Return a
-    // clean `timed_out` result so the gate hook pauses and the model stops
-    // retrying the blocked call.
-    if (localElicitTimedOut) {
-      const timedOutStructured: AskUserQuestionsStructuredContent = {
+/**
+ * Attempt delivery through the local elicitation channel, then any configured
+ * remote channel. Sets `delivery.reached` as soon as a channel has put the
+ * question in front of the user — answered, declined, cancelled or timed out
+ * there are all legitimate reasons for the gate to stay armed. Leaving it false
+ * is what tells the caller to roll the arm back.
+ *
+ * Throws rather than formatting errors: `askUserQuestionsHandler` owns both the
+ * error response and the rollback, and pairing them in one place is why a
+ * rethrow past a narrow error predicate can no longer leak an armed gate.
+ */
+async function deliverAskUserQuestions(
+  questions: AskUserQuestion[],
+  extra: McpToolExtra | undefined,
+  deps: AskUserQuestionsHandlerDeps,
+  delivery: AskUserQuestionsDelivery,
+): Promise<ToolContent> {
+  // Local-first: try the MCP host's elicitation channel (Claude Code,
+  // Cursor, etc.) before any configured remote channel. A misconfigured
+  // remote (e.g. expired Discord token returning 401) must not block the
+  // depth-verification gate when the user is sitting in front of the host.
+  let localElicitError: unknown;
+  let localElicitTimedOut = false;
+  let localElicitCancelledByClient = false;
+  try {
+    const elicitation = await withElicitTimeout(
+      deps.elicitInput(buildAskUserQuestionsElicitRequest(questions), {
+        timeout: ELICIT_TIMEOUT_MS,
+        ...(extra?.signal ? { signal: extra.signal } : {}),
+      }),
+      'ask_user_questions',
+      undefined,
+      extra?.signal,
+    );
+    delivery.reached = true;
+    if (elicitation.action === 'accept' && elicitation.content) {
+      const structured: AskUserQuestionsStructuredContent = {
         questions,
-        response: null,
-        cancelled: true,
-        timed_out: true,
+        response: buildAskUserQuestionsRoundResult(questions, elicitation),
+        cancelled: false,
       };
+      await recordAskUserQuestionsGateResult(structured, deps);
       return {
-        content: [{ type: 'text' as const, text: formatAskUserQuestionsTimeoutMessage(localElicitError) }],
-        structuredContent: timedOutStructured as unknown as Record<string, unknown>,
+        content: [{ type: 'text' as const, text: formatAskUserQuestionsElicitResult(questions, elicitation) }],
+        structuredContent: structured as unknown as Record<string, unknown>,
       };
     }
-
-    // Client aborted the tools/call. Do not fall through to remote (the signal
-    // is already aborted and no one is there to answer). Return a clean
-    // `cancelled` result so the gate hook sees a cancellation (gate stays
-    // pending, model re-asks) instead of a raw `isError` that skips the gate
-    // result recording entirely.
-    if (localElicitCancelledByClient) {
-      const cancelledStructured: AskUserQuestionsStructuredContent = {
-        questions,
-        response: null,
-        cancelled: true,
-      };
-      return {
-        content: [{ type: 'text' as const, text: 'ask_user_questions was cancelled by the client' }],
-        structuredContent: cancelledStructured as unknown as Record<string, unknown>,
-      };
+  } catch (err) {
+    if (!isLocalElicitFallbackError(err)) throw err;
+    localElicitError = err;
+    // A timeout is the host user not answering, not a channel failure.
+    // Returning here (instead of falling through to remote) gives the gate
+    // hook a clean `timed_out` signal so it pauses auto-mode and waits for
+    // the user instead of looping on the blocked call (#852).
+    if (isLocalElicitTimeoutError(err)) {
+      // The request did reach the client; nobody answered it in time. Counts
+      // as delivered, so the gate stays armed for the user to answer later.
+      delivery.reached = true;
+      localElicitTimedOut = true;
+    } else if (isLocalElicitClientAbortError(err)) {
+      // The caller aborted the tools/call. Handled below (do not fall
+      // through to remote; the signal is already aborted and no one is
+      // there to answer it either). Delivered: the request was sent and the
+      // caller tore it down, so the gate stays armed for the re-ask.
+      delivery.reached = true;
+      localElicitCancelledByClient = true;
+    } else {
+      console.warn(`[gsd:mcp] ask_user_questions local elicitation unavailable; trying remote fallback: ${formatErrorMessage(err)}`);
     }
+  }
 
-    // Local cancelled / unavailable — fall back to the configured remote
-    // channel (Discord, Slack, Telegram) if one is set.
-    if (deps.isRemoteConfigured()) {
-      let remoteResult: RemoteToolResult | null;
-      try {
-        remoteResult = await deps.tryRemoteQuestions(questions, extra?.signal);
-      } catch (err) {
-        if (localElicitError) {
-          throw new Error(
-            `Local elicitation failed (${formatErrorMessage(localElicitError)}); remote fallback failed (${formatErrorMessage(err)})`,
-          );
-        }
-        throw err;
-      }
-      if (remoteResult) {
-        const details = remoteResult.details as Record<string, unknown> | undefined;
-        if (details?.['timed_out'] || details?.['error']) {
-          // Mirror the timeout/error into structuredContent so the gate hook's
-          // `details?.cancelled || !details?.response` branch fires correctly
-          // (gate stays pending, model re-asks) instead of silently dropping
-          // because no `details` made it across the MCP wire. See #5267.
-          const failedStructured: AskUserQuestionsStructuredContent = {
-            questions,
-            response: null,
-            cancelled: true,
-          };
-          return {
-            content: [{ type: 'text' as const, text: remoteResult.content[0]?.text ?? 'Remote questions timed out or failed' }],
-            structuredContent: failedStructured as unknown as Record<string, unknown>,
-          };
-        }
-        // Successful remote answer — surface the normalized RoundResult that
-        // remote-questions.ts attached to `details.response` so the gate hook
-        // sees `details.response.answers[id].selected` on this path too.
-        // A malformed `response` (failing isRoundResultLike) is reported as
-        // an explicit cancellation rather than a silent `cancelled: false`
-        // with `response: null` — the latter would lie to any consumer that
-        // reads `structuredContent.cancelled` independently of `.response`.
-        const hasValidResponse = isRoundResultLike(details?.['response']);
-        const acceptedStructured: AskUserQuestionsStructuredContent = hasValidResponse
-          ? {
-              questions,
-              response: details!['response'] as AskUserQuestionsRoundResult,
-              cancelled: false,
-            }
-            : {
-              questions,
-              response: null,
-              cancelled: true,
-            };
-        await recordAskUserQuestionsGateResult(acceptedStructured, deps);
-        return {
-          content: [{ type: 'text' as const, text: remoteResult.content[0]?.text ?? '' }],
-          structuredContent: acceptedStructured as unknown as Record<string, unknown>,
-        };
-      }
-    }
+  // Host-side timeout: the user is at the host but didn't respond. Do not
+  // fall through to remote (no one is there to answer it either). Return a
+  // clean `timed_out` result so the gate hook pauses and the model stops
+  // retrying the blocked call.
+  if (localElicitTimedOut) {
+    const timedOutStructured: AskUserQuestionsStructuredContent = {
+      questions,
+      response: null,
+      cancelled: true,
+      timed_out: true,
+    };
+    return {
+      content: [{ type: 'text' as const, text: formatAskUserQuestionsTimeoutMessage(localElicitError) }],
+      structuredContent: timedOutStructured as unknown as Record<string, unknown>,
+    };
+  }
 
-    if (localElicitError) throw localElicitError;
-
+  // Client aborted the tools/call. Do not fall through to remote (the signal
+  // is already aborted and no one is there to answer). Return a clean
+  // `cancelled` result so the gate hook sees a cancellation (gate stays
+  // pending, model re-asks) instead of a raw `isError` that skips the gate
+  // result recording entirely.
+  if (localElicitCancelledByClient) {
     const cancelledStructured: AskUserQuestionsStructuredContent = {
       questions,
       response: null,
       cancelled: true,
     };
     return {
-      content: [{ type: 'text' as const, text: 'ask_user_questions was cancelled before receiving a response' }],
+      content: [{ type: 'text' as const, text: 'ask_user_questions was cancelled by the client' }],
       structuredContent: cancelledStructured as unknown as Record<string, unknown>,
     };
-  } catch (err) {
-    return errorContent(err instanceof Error ? err.message : String(err));
   }
+
+  // Local cancelled / unavailable — fall back to the configured remote
+  // channel (Discord, Slack, Telegram) if one is set.
+  if (deps.isRemoteConfigured()) {
+    let remoteResult: RemoteToolResult | null;
+    try {
+      remoteResult = await deps.tryRemoteQuestions(questions, extra?.signal);
+    } catch (err) {
+      if (localElicitError) {
+        throw new Error(
+          `Local elicitation failed (${formatErrorMessage(localElicitError)}); remote fallback failed (${formatErrorMessage(err)})`,
+        );
+      }
+      throw err;
+    }
+    if (remoteResult) {
+      // The remote channel produced a round — delivered, even when it reports
+      // a timeout or an error, because the question was posted and the gate
+      // must stay armed for the answer that may still arrive there.
+      delivery.reached = true;
+      const details = remoteResult.details as Record<string, unknown> | undefined;
+      if (details?.['timed_out'] || details?.['error']) {
+        // Mirror the timeout/error into structuredContent so the gate hook's
+        // `details?.cancelled || !details?.response` branch fires correctly
+        // (gate stays pending, model re-asks) instead of silently dropping
+        // because no `details` made it across the MCP wire. See #5267.
+        const failedStructured: AskUserQuestionsStructuredContent = {
+          questions,
+          response: null,
+          cancelled: true,
+        };
+        return {
+          content: [{ type: 'text' as const, text: remoteResult.content[0]?.text ?? 'Remote questions timed out or failed' }],
+          structuredContent: failedStructured as unknown as Record<string, unknown>,
+        };
+      }
+      // Successful remote answer — surface the normalized RoundResult that
+      // remote-questions.ts attached to `details.response` so the gate hook
+      // sees `details.response.answers[id].selected` on this path too.
+      // A malformed `response` (failing isRoundResultLike) is reported as
+      // an explicit cancellation rather than a silent `cancelled: false`
+      // with `response: null` — the latter would lie to any consumer that
+      // reads `structuredContent.cancelled` independently of `.response`.
+      const hasValidResponse = isRoundResultLike(details?.['response']);
+      const acceptedStructured: AskUserQuestionsStructuredContent = hasValidResponse
+        ? {
+            questions,
+            response: details!['response'] as AskUserQuestionsRoundResult,
+            cancelled: false,
+          }
+          : {
+            questions,
+            response: null,
+            cancelled: true,
+          };
+      await recordAskUserQuestionsGateResult(acceptedStructured, deps);
+      return {
+        content: [{ type: 'text' as const, text: remoteResult.content[0]?.text ?? '' }],
+        structuredContent: acceptedStructured as unknown as Record<string, unknown>,
+      };
+    }
+  }
+
+  if (localElicitError) throw localElicitError;
+
+  const cancelledStructured: AskUserQuestionsStructuredContent = {
+    questions,
+    response: null,
+    cancelled: true,
+  };
+  return {
+    content: [{ type: 'text' as const, text: 'ask_user_questions was cancelled before receiving a response' }],
+    structuredContent: cancelledStructured as unknown as Record<string, unknown>,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1345,6 +1475,29 @@ export async function createMcpServer(
             recordElicitationDiagnostic(server.server as unknown as ElicitationDiagnosticServer, error);
             throw error;
           }
+        },
+        // Judged from the capabilities as the SDK server resolved them (after
+        // the ElicitationCapabilitySchema preprocess that upgrades a flat
+        // `elicitation: {}` to `{ form: {} }`), and against exactly the field
+        // the SDK's own elicitInput asserts on. Raw initialize params do not
+        // show that, and reasoning from them produced a wrong fix once already.
+        canElicit: () => {
+          try {
+            const capabilities = (server.server as unknown as ElicitationDiagnosticServer)
+              .getClientCapabilities?.();
+            // No resolved capabilities at all (no accessor, or not yet
+            // connected) is not evidence of absence: attempt delivery and let
+            // the rollback cover a failure. Only a capability set that WAS
+            // resolved and lacks `elicitation.form` is a knowable refusal.
+            if (!capabilities || typeof capabilities !== 'object') return true;
+
+            return !!(capabilities as { elicitation?: { form?: unknown } }).elicitation?.form;
+          } catch {
+            return true;
+          }
+        },
+        recordUnreachable: (reason) => {
+          recordElicitationDiagnostic(server.server as unknown as ElicitationDiagnosticServer, new Error(reason));
         },
         isRemoteConfigured,
         tryRemoteQuestions,

@@ -27,6 +27,7 @@ import { tmpdir } from "node:os";
 import { registerHooks } from "../bootstrap/register-hooks.ts";
 import {
   _setWriteGateInterleaveHookForTest,
+  armPendingGateForDelivery,
   childWriteGateAdapter,
   clearDiscussionFlowState,
   getPendingGate,
@@ -407,4 +408,68 @@ test("seam: gate mutation fails OPEN when a live peer holds the lock (never bloc
   } finally {
     releaseSyncLock(dir, WRITE_GATE_LOCK_NAME);
   }
+});
+
+// ── (e) arm/rollback pairing ────────────────────────────────────────────────
+//
+// Arming is only half of a pair: `armPendingGate` deletes the gate's own
+// verification and its milestone's depth verification, which is right for a
+// genuine re-ask and wrong for a delivery that never reached the user. The
+// capture is what lets the failed case be put back.
+
+test("seam: rolling back an arm restores the verification the arm revoked", (t) => {
+  const dir = makeTempDir("rollback-verified");
+  t.after(() => cleanup(dir));
+
+  // A previously CONFIRMED gate, as the child would have left it.
+  childWriteGateAdapter.markApprovalGateVerified(GATE, dir);
+  childWriteGateAdapter.markDepthVerified("M007", dir);
+
+  // The child arms for a fresh delivery attempt — its adapter arms
+  // unconditionally, revoking both verifications.
+  const arm = armPendingGateForDelivery(childWriteGateAdapter, GATE, dir);
+  assert.ok(arm, "the child adapter always arms");
+  assert.equal(getPendingGate(dir), GATE);
+  assert.deepEqual(loadWriteGateSnapshot(dir).verifiedApprovalGates, []);
+  assert.deepEqual(loadWriteGateSnapshot(dir).verifiedDepthMilestones, []);
+
+  childWriteGateAdapter.rollbackArm(arm!);
+
+  const restored = loadWriteGateSnapshot(dir);
+  assert.equal(restored.pendingGateId, null);
+  assert.deepEqual(restored.verifiedApprovalGates, [GATE]);
+  assert.deepEqual(restored.verifiedDepthMilestones, ["M007"]);
+});
+
+test("seam: rolling back an arm restores the gate it displaced, not just null", (t) => {
+  const dir = makeTempDir("rollback-displaced");
+  t.after(() => cleanup(dir));
+
+  const other = "depth_verification_M008_confirm";
+  childWriteGateAdapter.setPending(other, dir);
+
+  const arm = armPendingGateForDelivery(childWriteGateAdapter, GATE, dir);
+  assert.equal(getPendingGate(dir), GATE);
+
+  childWriteGateAdapter.rollbackArm(arm!);
+
+  assert.equal(
+    getPendingGate(dir),
+    other,
+    "clearing to null would drop a block the earlier, still-unanswered question owns",
+  );
+});
+
+test("seam: a suppressed host arm reports nothing to roll back", (t) => {
+  const dir = makeTempDir("rollback-suppressed");
+  t.after(() => cleanup(dir));
+
+  hostWriteGateAdapter.markApprovalGateVerified(GATE, dir);
+
+  assert.equal(
+    armPendingGateForDelivery(hostWriteGateAdapter, GATE, dir),
+    null,
+    "verified-on-disk wins, so nothing changed and there is nothing to undo",
+  );
+  assert.deepEqual(loadWriteGateSnapshot(dir).verifiedApprovalGates, [GATE]);
 });

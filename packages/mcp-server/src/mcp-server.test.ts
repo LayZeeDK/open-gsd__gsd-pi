@@ -1796,6 +1796,323 @@ describe('createMcpServer tool registration', () => {
     );
     assert.match(result.content[0]?.text ?? '', /cancelled by the client/i);
   });
+
+  // -------------------------------------------------------------------------
+  // Arm/deliver/rollback pairing
+  //
+  // Arming revokes prior verification and refuses every workflow tool while
+  // permitting only ask_user_questions. So an arm that outlives a failed
+  // delivery is not a stale flag: the only tool the gate still allows is the
+  // call that just failed, and a milestone a human HAD verified loses that
+  // verification. These pin the pairing, not the error text.
+  // -------------------------------------------------------------------------
+
+  /**
+   * Write-gate double recording every call, with the delivery pair the real
+   * module exposes. `verified` seeds the pre-arm state so a rollback that fails
+   * to restore verification is visible.
+   */
+  function gateSpy(verified: { gate?: boolean; milestone?: boolean } = {}) {
+    const calls: string[] = [];
+    let approvalVerified = verified.gate ?? false;
+    let depthVerified = verified.milestone ?? false;
+    let pendingGateId: string | null = null;
+
+    return {
+      calls,
+      get state() {
+        return { pendingGateId, approvalVerified, depthVerified };
+      },
+      isGateQuestionId(questionId: string) {
+        return questionId.startsWith('depth_verification_');
+      },
+      isDepthConfirmationAnswer(selected: unknown, options?: Array<{ label?: string }>) {
+        return selected === options?.[0]?.label;
+      },
+      setPendingGate(gateId: string, basePath: string) {
+        calls.push(`unpaired-pending:${gateId}:${basePath}`);
+      },
+      setPendingGateForDelivery(gateId: string, basePath: string) {
+        calls.push(`arm:${gateId}:${basePath}`);
+        const arm = {
+          gateId,
+          basePath,
+          previousPendingGateId: pendingGateId,
+          restoreApprovalGate: approvalVerified,
+          restoreDepthMilestoneId: depthVerified ? 'M003' : null,
+        };
+        pendingGateId = gateId;
+        approvalVerified = false;
+        depthVerified = false;
+        return arm;
+      },
+      rollbackPendingGateArm(arm: Record<string, unknown>) {
+        calls.push(`rollback:${String(arm['gateId'])}`);
+        pendingGateId = (arm['previousPendingGateId'] as string | null) ?? null;
+        if (arm['restoreApprovalGate']) approvalVerified = true;
+        if (arm['restoreDepthMilestoneId']) depthVerified = true;
+      },
+      markApprovalGateVerified(gateId?: string | null, basePath?: string) {
+        calls.push(`approval:${gateId}:${basePath}`);
+        approvalVerified = true;
+      },
+      markDepthVerified(milestoneId?: string | null, basePath?: string) {
+        calls.push(`depth:${milestoneId}:${basePath}`);
+        depthVerified = true;
+      },
+      clearPendingGate(basePath: string) {
+        calls.push(`clear:${basePath}`);
+        pendingGateId = null;
+      },
+      extractDepthVerificationMilestoneId(questionId: string) {
+        return questionId.match(/_(M\d+)_/)?.[1] ?? null;
+      },
+    };
+  }
+
+  const gateQuestions = [
+    {
+      id: 'depth_verification_M003_confirm',
+      header: 'Depth Check',
+      question: 'Did I capture the depth right?',
+      options: [
+        { label: 'Yes, you got it (Recommended)', description: 'Continue.' },
+        { label: 'Not quite', description: 'Clarify.' },
+      ],
+    },
+  ];
+
+  it('ask_user_questions arms nothing when neither elicitation nor a remote channel can reach the user', async () => {
+    const writeGate = gateSpy({ gate: true, milestone: true });
+    let elicitCalls = 0;
+
+    const result = await askUserQuestionsHandler(gateQuestions, undefined, {
+      async elicitInput() {
+        elicitCalls++;
+        throw new Error('Client does not support form elicitation.');
+      },
+      canElicit() {
+        return false;
+      },
+      isRemoteConfigured() {
+        return false;
+      },
+      async tryRemoteQuestions() {
+        throw new Error('should not be called');
+      },
+      writeGate,
+      writeGateBasePath: '/tmp/gsd-project',
+    });
+
+    assert.equal('isError' in result && result.isError, true);
+    assert.match(result.content[0]?.text ?? '', /cannot reach the user/i);
+    assert.equal(elicitCalls, 0, 'must not attempt an elicitation it knows cannot arrive');
+    assert.deepEqual(writeGate.calls, [], 'no arm, and therefore no rollback to make');
+    assert.deepEqual(writeGate.state, {
+      pendingGateId: null,
+      approvalVerified: true,
+      depthVerified: true,
+    });
+  });
+
+  it('ask_user_questions still attempts delivery without elicitation when a remote channel is configured', async () => {
+    const writeGate = gateSpy();
+
+    const result = await askUserQuestionsHandler(gateQuestions, undefined, {
+      async elicitInput() {
+        throw new Error('Client does not support form elicitation.');
+      },
+      canElicit() {
+        return false;
+      },
+      isRemoteConfigured() {
+        return true;
+      },
+      async tryRemoteQuestions() {
+        return {
+          content: [{ type: 'text', text: 'remote response' }],
+          details: {
+            response: {
+              endInterview: false,
+              answers: {
+                depth_verification_M003_confirm: { selected: 'Yes, you got it (Recommended)', notes: '' },
+              },
+            },
+          },
+        };
+      },
+      writeGate,
+      writeGateBasePath: '/tmp/gsd-project',
+    });
+
+    assert.equal('isError' in result && result.isError, false);
+    assert.deepEqual(writeGate.calls, [
+      'arm:depth_verification_M003_confirm:/tmp/gsd-project',
+      'approval:depth_verification_M003_confirm:/tmp/gsd-project',
+      'depth:M003:/tmp/gsd-project',
+      'clear:/tmp/gsd-project',
+    ]);
+  });
+
+  it('ask_user_questions rolls the arm back and restores prior verification when delivery fails', async () => {
+    const writeGate = gateSpy({ gate: true, milestone: true });
+
+    const result = await askUserQuestionsHandler(gateQuestions, undefined, {
+      async elicitInput() {
+        throw new Error('Client does not support form elicitation.');
+      },
+      isRemoteConfigured() {
+        return false;
+      },
+      async tryRemoteQuestions() {
+        throw new Error('should not be called');
+      },
+      writeGate,
+      writeGateBasePath: '/tmp/gsd-project',
+    });
+
+    assert.equal('isError' in result && result.isError, true);
+    assert.deepEqual(writeGate.calls, [
+      'arm:depth_verification_M003_confirm:/tmp/gsd-project',
+      'rollback:depth_verification_M003_confirm',
+    ]);
+    assert.deepEqual(
+      writeGate.state,
+      { pendingGateId: null, approvalVerified: true, depthVerified: true },
+      'a delivery that never happened must not cost a human-verified milestone its verification',
+    );
+  });
+
+  it('ask_user_questions rolls the arm back when the remote fallback throws', async () => {
+    // The remote-configured path is NOT exempt: a failed remote fallback throws
+    // a message that is not a capability assertion, so a rollback keyed on the
+    // capability wording would miss it and leave the session deadlocked.
+    const writeGate = gateSpy({ gate: true, milestone: true });
+
+    const result = await askUserQuestionsHandler(gateQuestions, undefined, {
+      async elicitInput() {
+        throw new Error('Client does not support form elicitation.');
+      },
+      isRemoteConfigured() {
+        return true;
+      },
+      async tryRemoteQuestions() {
+        throw new Error('401 Unauthorized');
+      },
+      writeGate,
+      writeGateBasePath: '/tmp/gsd-project',
+    });
+
+    assert.equal('isError' in result && result.isError, true);
+    assert.match(result.content[0]?.text ?? '', /remote fallback failed/);
+    assert.deepEqual(writeGate.calls, [
+      'arm:depth_verification_M003_confirm:/tmp/gsd-project',
+      'rollback:depth_verification_M003_confirm',
+    ]);
+    assert.deepEqual(writeGate.state, {
+      pendingGateId: null,
+      approvalVerified: true,
+      depthVerified: true,
+    });
+  });
+
+  it('ask_user_questions rolls the arm back when elicitation fails in a way no error predicate recognizes', async () => {
+    // isLocalElicitFallbackError returns false here, so the error is rethrown
+    // straight past every fallback branch. A rollback expressed as a predicate
+    // on the error would not fire; a finally does.
+    const writeGate = gateSpy();
+
+    const result = await askUserQuestionsHandler(gateQuestions, undefined, {
+      async elicitInput() {
+        throw new Error('Converting circular structure to JSON');
+      },
+      isRemoteConfigured() {
+        return true;
+      },
+      async tryRemoteQuestions() {
+        throw new Error('should not be reached');
+      },
+      writeGate,
+      writeGateBasePath: '/tmp/gsd-project',
+    });
+
+    assert.equal('isError' in result && result.isError, true);
+    assert.deepEqual(writeGate.calls, [
+      'arm:depth_verification_M003_confirm:/tmp/gsd-project',
+      'rollback:depth_verification_M003_confirm',
+    ]);
+    assert.equal(writeGate.state.pendingGateId, null);
+  });
+
+  it('ask_user_questions keeps the gate armed when the question reached the user and was cancelled', async () => {
+    const writeGate = gateSpy();
+
+    const result = await askUserQuestionsHandler(gateQuestions, undefined, {
+      async elicitInput() {
+        return { action: 'cancel' as const };
+      },
+      isRemoteConfigured() {
+        return false;
+      },
+      async tryRemoteQuestions() {
+        throw new Error('should not be called');
+      },
+      writeGate,
+      writeGateBasePath: '/tmp/gsd-project',
+    });
+
+    assert.equal('isError' in result && result.isError, false);
+    assert.deepEqual(writeGate.calls, ['arm:depth_verification_M003_confirm:/tmp/gsd-project']);
+    assert.equal(
+      writeGate.state.pendingGateId,
+      'depth_verification_M003_confirm',
+      'a delivered question the user declined is a genuine re-ask — the gate must stay armed',
+    );
+  });
+
+  it('ask_user_questions keeps the gate armed when the delivered question times out', async () => {
+    const writeGate = gateSpy();
+
+    const result = await askUserQuestionsHandler(gateQuestions, undefined, {
+      async elicitInput() {
+        throw new Error('MCP error -32001: Request timed out');
+      },
+      isRemoteConfigured() {
+        return false;
+      },
+      async tryRemoteQuestions() {
+        throw new Error('should not be called');
+      },
+      writeGate,
+      writeGateBasePath: '/tmp/gsd-project',
+    });
+
+    assert.equal('isError' in result && result.isError, false);
+    assert.deepEqual(writeGate.calls, ['arm:depth_verification_M003_confirm:/tmp/gsd-project']);
+    assert.equal(writeGate.state.pendingGateId, 'depth_verification_M003_confirm');
+  });
+
+  it('ask_user_questions falls back to the unpaired arm when the write-gate module predates the pair', async () => {
+    const writeGate = gateSpy();
+    const { setPendingGateForDelivery: _arm, rollbackPendingGateArm: _rollback, ...legacyGate } = writeGate;
+
+    const result = await askUserQuestionsHandler(gateQuestions, undefined, {
+      async elicitInput() {
+        throw new Error('Client does not support form elicitation.');
+      },
+      isRemoteConfigured() {
+        return false;
+      },
+      async tryRemoteQuestions() {
+        throw new Error('should not be called');
+      },
+      writeGate: legacyGate,
+      writeGateBasePath: '/tmp/gsd-project',
+    });
+
+    assert.equal('isError' in result && result.isError, true);
+    assert.deepEqual(writeGate.calls, ['unpaired-pending:depth_verification_M003_confirm:/tmp/gsd-project']);
+  });
 });
 
 // ---------------------------------------------------------------------------
