@@ -11,20 +11,22 @@ about the mechanics.
 - [Rebuilding](#rebuilding)
 - [The Claude Agent SDK bump](#the-claude-agent-sdk-bump)
 - [Rebasing onto a new upstream tag](#rebasing-onto-a-new-upstream-tag)
+- [When a patch redefines a shared value](#when-a-patch-redefines-a-shared-value)
 - [Expected test failures](#expected-test-failures)
 
 ## Layout
 
 | | |
 | --- | --- |
-| Working branch | `LayZeeDK/dev` -- the patches, one dependency bump, plus the docs as the last commit |
-| Base | an upstream release tag, currently **`v1.14.0`** (`aa8789b4`) |
+| Working branch | `LayZeeDK/dev` -- the patches, one dependency bump, and `docs:`/`chore:` commits, with `PATCHES.md` last |
+| Base | an upstream release tag, currently **`v1.15.0`** (`95f8c3fb`) |
 | Remotes | `origin` = `LayZeeDK/open-gsd__gsd-pi`, `upstream` = `open-gsd/gsd-pi` |
 | `main` | tracks upstream; not where the patches live |
 
-`main` is not the base on purpose: it was already 13 commits past `v1.14.0` when
-this branch was cut, so basing on the tag keeps the fork pinned to a released
-version rather than to a moving branch.
+`main` is not the base on purpose: it is a moving branch, and basing on the tag
+keeps the fork pinned to a released version. At the v1.15.0 rebase `main` and
+`v1.15.0` happened to be the same commit, so the distinction cost nothing that
+time -- do not read that coincidence as a reason to base on `main` next time.
 
 Find the current base at any time:
 
@@ -186,9 +188,9 @@ pnpm run verify:pr        # build:core + typecheck:extensions + test:unit + life
 
 ## The Claude Agent SDK bump
 
-This branch pins `@anthropic-ai/claude-agent-sdk` at **`0.3.227`**, up from
+This branch pins `@anthropic-ai/claude-agent-sdk` at **`0.3.229`**, up from
 upstream's exact `0.2.83`. Why, and the measurements behind it, are in
-[PATCHES.md](PATCHES.md#the-sdk-bump-0283---03227). The mechanics that affect
+[PATCHES.md](PATCHES.md#the-sdk-bump-0283---03229). The mechanics that affect
 day-to-day work here:
 
 ### Installing
@@ -220,8 +222,9 @@ unstaged lockfile passes locally and then fails every CI job with
 ### The install got much bigger, everywhere
 
 0.3.x ships no `cli.js`. The CLI is a platform `optionalDependency` -- on this
-host `@anthropic-ai/claude-agent-sdk-win32-arm64`, whose `claude.exe` is **287
-MB** on disk. An arm64 build exists, unlike `@opengsd/gsd-browser`.
+host `@anthropic-ai/claude-agent-sdk-win32-arm64`, whose `claude.exe` is
+**296,566,432 bytes** (~283 MiB) at 0.3.229. Re-measure it at each bump rather
+than carrying the figure forward; it was 286,900,384 at 0.3.227. An arm64 build exists, unlike `@opengsd/gsd-browser`.
 
 **This is not a this-host-only cost.** The platform package is a transitive
 optional dependency, so the matching linux-x64 build also lands on every CI
@@ -254,11 +257,22 @@ binary.
 
 `buildSdkOptions` returns `Record<string, unknown>`, so a renamed or dropped
 `query` option fails **silently** -- the unit tests assert on the object gsd-pi
-*builds*, not on what the SDK consumes, and nothing else covers it. At 0.3.227 the
-result was 0 keys removed, 14 added, all 28 keys gsd-pi sets still present. Diff
-the `Options` type in `node_modules/@anthropic-ai/claude-agent-sdk/sdk.d.ts`
-against the keys `buildSdkOptions` sets, and record the result in the commit
-message.
+*builds*, not on what the SDK consumes, and nothing else covers it. Diff the
+`Options` type in `node_modules/@anthropic-ai/claude-agent-sdk/sdk.d.ts` against
+the keys `buildSdkOptions` sets, and record the result in the commit message.
+
+At 0.3.229 all **15** keys `buildSdkOptions` sets are present in the 64-key
+`Options` type; 0 removed, 0 renamed. The type is byte-identical to 0.3.227's.
+
+> **Count the keys from the code, not from this file.** An earlier revision of
+> both this doc and the bump's commit message claimed "all 28 keys". The return
+> literal sets 15 static keys plus the caller-supplied `...sdkExtraOptions`
+> passthrough, whose members are not statically knowable; 28 was never
+> reproducible. When you re-run the diff, extract the keys from the `return {`
+> literal in `buildSdkOptions` -- including the SHORTHAND members
+> (`permissionMode,` `settingSources,` `disallowedTools,`) and the conditional
+> spreads, which a naive `key:` scan misses -- rather than trusting the number
+> recorded here.
 
 ### Verifying the client advertises elicitation
 
@@ -274,10 +288,20 @@ performs a real handshake with no model and no tokens. Expect
 ```json
 {"protocolVersion":"2025-11-25",
  "capabilities":{"roots":{"listChanged":true},"elicitation":{}},
- "clientInfo":{"name":"claude-code","version":"2.1.227", ...}}
+ "clientInfo":{"name":"claude-code","version":"2.1.229", ...}}
 ```
 
 Under 0.2.83 the same probe yields `{"roots":{}}` -- no elicitation key at all.
+
+Two mechanics the probe needs, both learned by getting them wrong first:
+
+- **`claude mcp list` has no `--mcp-config` flag** (`error: unknown option`).
+  Register the stub with `claude mcp add probe --scope user -- node <stub>` under
+  the isolated `CLAUDE_CONFIG_DIR`, then run `claude mcp list`.
+- **Probe the SDK's OWN binary**, not the one on PATH:
+  `node_modules/@anthropic-ai/claude-agent-sdk-win32-arm64/claude.exe`. That is
+  what `stream-adapter.ts` actually executes, and it is the whole point of the
+  bump. A PATH `claude` that happens to match the version proves nothing.
 
 ## Rebasing onto a new upstream tag
 
@@ -323,15 +347,52 @@ forcing the old diff back in. Three outcomes, all normal:
 - **Restructured** -- the defect moved. Follow it; the test tells you when you
   have it right.
 
+**A fourth outcome, and the one that costs most to miss: the defect is gone but
+the patch still applies.** A hunk that merges cleanly is not evidence it is still
+needed. At the v1.15.0 rebase, half of patch 4 replayed without a murmur while
+upstream had quietly (a) closed the writer the patch blamed, (b) added a test
+asserting the OPPOSITE contract, and (c) added two new consumers that assumed the
+old semantics. The clean merge is exactly why nobody looked. See
+[When a patch redefines a shared value](#when-a-patch-redefines-a-shared-value).
+
 Known churn to expect at the next rebase:
 
-- **Patch 12** touches `task-completion-compatibility-adapter.ts`, which upstream
-  has already changed past `v1.14.0` (`63254779`, `2e4ca77f`, `3037a37c`).
+- **Patch 12** touches `task-completion-compatibility-adapter.ts`. The v1.14.0
+  edition of this list predicted churn there from `63254779`, `2e4ca77f` and
+  `3037a37c`; **it did not materialise** -- that file and
+  `packages/mcp-server/src/server.ts` were byte-identical across v1.14.0..v1.15.0
+  and patch 12's rewrite landed clean. Treat the prediction as still open rather
+  than as a standing fact.
+- **The projection family is the live churn.** v1.15.0 restructured
+  `markdown-renderer.ts` (sha computation moved from flush time to write time),
+  renamed `detectExternalMarkdownEdit` to `observeExternalMarkdownEdits`, and
+  added `projection-observation.ts`, `projection-mutation-guard.ts`,
+  `projection-content-hash.ts` and `projection-worker.ts`. Anything touching
+  projection shas or the compat marker will keep meeting new consumers here.
+- **`database-maintenance-fence.ts`** -- upstream rewrote `projectionDatabasePath`
+  once already (hoisting `basename(...)` into `const name`, adding a `.planning`
+  branch). Patch 3 inserts into that exact gap.
 - **The SDK bump is not a patch and does not rebase like one.** If the new
   upstream tag already pins a `0.3.x` agent SDK, drop the bump commit and keep
   only whatever `stream-adapter.ts` change is still needed; if upstream is still
   on `0.2.x`, re-derive the version rather than replaying the old
   `pnpm-lock.yaml` diff. Re-run the options diff either way.
+- **Re-check the SDK dist-tags at the moment you rebase, not from the plan.** The
+  v1.15.0 plan specified `0.3.228` because `0.3.229` was `next`; by execution day
+  `0.3.229` had been promoted to `latest` and the recorded rationale was stale.
+
+### rerere will answer conflicts for you, and it can be wrong
+
+`rerere.enabled` is `true` in this repo, so a conflict resolved in a trial rebase
+is replayed silently in the real one -- the only trace is a
+`Resolved '<file>' using previous resolution.` line in the rebase output. It is a
+genuine time-saver across the five conflicts this fork hits, but **the replayed
+resolution is not reviewed by anything**. At the v1.15.0 rebase it dropped a
+five-line explanatory comment from patch 3's hunk while producing otherwise
+correct code, which no test could have caught.
+
+Read every rerere-resolved hunk against `git show <original-commit> -- <file>`
+before staging it.
 
 To drop a commit during the rebase, `git rebase --skip`. To drop one afterwards:
 
@@ -369,8 +430,26 @@ node --import ./src/resources/extensions/gsd/tests/resolve-ts.mjs \
      src/resources/extensions/gsd/tests/error-utils.test.ts \
      src/resources/extensions/gsd/tests/register-hooks-gate-rollback.test.ts \
      src/resources/extensions/gsd/tests/write-gate-seam.test.ts \
-     src/tests/headless-doctor-args.test.ts
+     src/resources/extensions/gsd/tests/workflow-tool-executors.test.ts \
+     src/resources/extensions/gsd/tests/plan-milestone-artifact-verification.test.ts \
+     src/tests/headless-doctor-args.test.ts \
+     src/resources/extensions/gsd/tests/derive-state-db.test.ts \
+     src/resources/extensions/gsd/tests/state-projection-scoped-write.test.ts
 ```
+
+Patch 15 also lands a case in the `claude-code-cli` tree, which the
+`resolve-ts.mjs` hook resolves fine despite shipping under `gsd/tests/`:
+
+```bash
+node --import ./src/resources/extensions/gsd/tests/resolve-ts.mjs \
+     --experimental-strip-types --test \
+     src/resources/extensions/claude-code-cli/tests/stream-adapter.test.ts
+```
+
+> That suite carries one pre-existing failure on this host,
+> `buildSdkOptions prefers workflow MCP question tools over native
+> AskUserQuestion`, asserting `/tmp/project` against `C:\tmp\project`. Baseline
+> it; 1 of 205 is the expected shape.
 
 Patch 14 also lands cases in `packages/mcp-server/src/mcp-server.test.ts`, which
 that package's own suite runs:
@@ -400,34 +479,128 @@ Amend the tip commit rather than adding a new one, so the doc stays last.
   `native/npm/*/package.json`. CONTRIBUTING reserves those for releases.
 - `node:test` + `node:assert/strict` only; no new Vitest or Jest.
 - No source-grep tests. CI enforces this via `scripts/check-source-grep-tests.sh`.
-- One commit per patch, its tests included.
+- One commit per patch, its tests included. Two standing exceptions: the
+  elicitation work is split across a `test(mcp-server):` commit and its `feat:`
+  commit, and the `docs:`/`chore:` commits are interleaved rather than all last
+  -- only `PATCHES.md` is guaranteed to be the final commit.
+
+## When a patch redefines a shared value
+
+The most expensive class of fork patch is the one that changes what a value
+*means* rather than fixing a computation. Patch 4 is the worked example: it made
+the `.gsd` compat-marker sha mean "sha of the STRIPPED bytes" where upstream
+means "sha of the exact rendered bytes".
+
+Such a patch is only as correct as the set of consumers it updates, and **that
+set grows upstream between rebases, silently and without conflicts**. At v1.15.0
+patch 4 replayed with one ordinary conflict, and was nonetheless wrong in three
+new places that did not exist at v1.14.0:
+
+| new at v1.15.0 | consequence of the redefinition |
+| --- | --- |
+| `projection-observation.ts:161` | re-read guard mismatched, so a hand-edited stamped projection was **never quarantined** -- silent data loss on the `/gsd sync` path |
+| `projection-mutation-guard.ts:95` | "matches baseline" short-circuit never fired, so **every** managed `.gsd` write dropped a quarantine copy nothing prunes |
+| `gsd-rebuild.test.ts` "projection baselines retain the exact rendered intent" | upstream test asserting the raw contract outright |
+
+Procedure when you carry, or are tempted to write, a patch of this shape:
+
+1. **Enumerate the consumers on the NEW base, not from the patch's own notes.**
+   `git grep -n` the value's producer and every reader. The patch's site list was
+   accurate for the base it was written on and is not evidence about this one.
+2. **Ask whether the defect still exists before re-deriving the fix.** For patch 4
+   it did not: `stampProjectionContent` and `recordProjectionWrite` are each
+   called from exactly one place, both inside `writeAndStore`, on the same bytes,
+   so nothing can produce a stamp-only mismatch. The surviving PLAN.md drift is a
+   **content** difference between two renderers (measured: 170 bytes against 366),
+   which stripping never addressed -- the health line reports it either way.
+3. **An upstream test asserting the opposite contract is a decision point, not a
+   nuisance.** Editing it makes the fork carry a test delta forever and every
+   future consumer breaks again. Prefer withdrawing the redefinition.
+4. **Measure both directions before choosing.** Drive the real functions under
+   each variant and compare; do not reason it. The reasoned prediction here
+   ("reverting re-opens phantom PLAN.md drift") was measured and found FALSE.
+
+The v1.15.0 outcome: patch 4 kept the two read-side comparisons that are still
+justified (`formatCompatHealthLine`, `removeOwnedPlanProjection` -- the latter
+proven by measurement: reverting it strands plan files) and withdrew the two that
+redefined the shared value. `markdown-renderer.ts` and `external-markdown-edit.ts`
+are byte-identical to upstream again.
+
+**Corollary for the acceptance list.** It gates the patches, not the code they
+touch. All three defects above sat outside it, and `gsd-rebuild.test.ts` -- which
+pins the contract patch 4 changes -- was never on it. When a patch redefines a
+shared value, add the upstream suites that exercise that value to the list.
 
 ## Expected test failures
 
 This tree carries failures that predate the fork. Baseline them before treating
 a red test as something you broke.
 
-**All counts below measured 2026-08-11 on win32-arm64, at patch 14.**
+**Every count below was measured 2026-08-13 on win32-arm64, on the v1.15.0 base
+at patch 17 with the SDK at 0.3.229.** The whole section was re-measured for that
+rebase; no figure is carried forward from the v1.14.0 edition.
 
-> The 15 per-patch acceptance suites stand at **265 of 266**, the one failure
-> being the `chmodSync` test named below. `pnpm --filter @opengsd/mcp-server run
-> test` is **250 of 250** (2 skipped).
+### Per-patch acceptance suites
+
+The 19-suite list runs **418** cases. Over four consecutive runs with no code
+change: **417 / 414 / 414 / 415**, i.e. 1 to 4 failures varying with nothing but
+the run.
+
+Exactly one failure is deterministic -- the `chmodSync` ROADMAP-divergence test
+named below. Everything else is projection-lock contention, which moves between
+`task-completion-compatibility-adapter.test.ts` and
+`workflow-tool-executors.test.ts` depending on process co-scheduling. Measured
+alone, both go green: `task-completion-compatibility-adapter.test.ts` at 36/36,
+35/36, 36/36 over three runs, and `workflow-tool-executors.test.ts` clean.
+
+**A single red run of this list proves nothing -- repeat it**, and re-run a suspect
+suite alone before attributing anything to your change.
+
+| target | result |
+| --- | --- |
+| 19-suite acceptance list | 417 / 414 / 414 / 415 of **418** |
+| `claude-code-cli/tests/stream-adapter.test.ts` | **204 of 205** |
+| `pnpm --filter @opengsd/mcp-server run test` | **250 of 250** (2 skipped) |
+| `gsd-rebuild.test.ts` | **10 of 11** |
+
+The stream-adapter failure is the long-standing
+`buildSdkOptions prefers workflow MCP question tools over native AskUserQuestion`,
+asserting `/tmp/project` against `C:\tmp\project`.
+
+`gsd-rebuild.test.ts` is **not** on the acceptance list but is worth running after
+any projection change -- it pins the compat-marker contract (see
+[When a patch redefines a shared value](#when-a-patch-redefines-a-shared-value)).
+Its one failure, `trusted marker baselines do not misclassify pending DB renders`,
+is pre-existing: it fails identically with patch 4's write-side hunks applied and
+reverted, so it is not the fork's.
+
+> The count moved 396 -> 418 across the v1.15.0 rebase: **+14** from upstream's
+> own additions to these suites, **-1** for the obsolete
+> `detect ignores a stamp-only difference against the marker baseline` withdrawn
+> with patch 4's write-side hunks, and **+9** from patch 7 pinning the full
+> verificationEvidence field set (its parameterised loop went 4 -> 12 fields,
+> plus one new standalone case). 396 + 14 - 1 + 9 = 418, so every delta is
+> accounted for rather than inferred.
+>
+> An intermediate reading of **411** appears in this session's notes; it is not a
+> waypoint in that arithmetic. It was measured while a compat-health-line case
+> existed that was later withdrawn with the same write-side hunks, so the file is
+> back to its pre-rebase 9 cases. Reconcile against the tree, not against a
+> number recorded mid-flight.
 
 ### Whole suite (`test:unit`, what `verify:pr` runs)
 
+Both rows measured on one tree in one sitting, differing only by reverting the
+fork's `src/` and `packages/` files to `v1.15.0`:
+
 | tree | passed | failed | skipped |
 | --- | --- | --- | --- |
-| base `32d2528c`, fork files reverted | 2905 | **1124** | 13 |
-| `LayZeeDK/dev` at patch 13, source reverted | 2924 | **1120** | 13 |
-| `LayZeeDK/dev` at patch 14 + the SDK bump | 2924 | **1121** | 13 |
+| `v1.15.0` source, fork files reverted | 2927 | **1126** | 13 |
+| `LayZeeDK/dev` at patch 17 + SDK 0.3.229 | 2950 | **1128** | 13 |
 
-Rows 2 and 3 were measured on one tree, differing only by reverting patch 14's
-and the SDK bump's source files, so the delta is **+0 passing, +1 failing** and is
-attributed exactly rather than inferred -- diffing the failing-suite lists yields
-one entry, `register-hooks-gate-rollback.test.js`, and nothing repaired.
-
-**That +1 says nothing about the test.** Under `test:unit:compiled` **945 of 963
-suites already fail wholesale** on a single pre-existing loader problem:
+**Treat this column as nearly useless for judging new work on this host.** Under
+`test:unit:compiled` the overwhelming majority of suites fail wholesale on one
+pre-existing loader problem:
 
 ```
 ERR_UNSUPPORTED_ESM_URL_SCHEME
@@ -436,70 +609,51 @@ ESM loader. On Windows, absolute paths must be valid file:// URLs.
 Received protocol 'd:'
 ```
 
-`write-gate.test.js`, untouched by any patch, fails identically. So **every new
-test file adds exactly one failure to this column regardless of its contents**,
-and the column is close to useless for judging new work on this host. Judge new
-tests with the strip-types runner instead -- the same file is 5 of 5 there.
+Because those suites never execute, the totals barely respond to real changes:
+the v1.15.0 rebase removed two tests, added nine, and rewrote two comparison
+sites, and the patched row did not move at all. Judge new tests with the
+strip-types runner instead.
 
-**`verify:pr` cannot be used as a pass/fail gate on this host**: it was already
-failing 1124 before any fork patch existed. Compare against the baseline row, and
-re-measure the baseline after every rebase.
+**`verify:pr` cannot be used as a pass/fail gate on this host** -- upstream
+`v1.15.0` alone fails 1126. Compare against the measured baseline row, and
+re-measure both rows after every rebase.
 
-> **A correction worth reading before you trust an inherited row.** This section
-> previously carried a projection -- "expect the passing column to be 10 higher"
-> after the review pass, i.e. ~2932 -- that was never measured. The measured value
-> is **2924**. Chasing the 8-test discrepancy against a number nobody had checked
-> cost real time. This is the same trap as patch 9's cautionary tale, one level
-> up: **do not record a projected baseline, and do not treat an un-remeasured one
-> as fact.** Measure both rows on one tree, in one sitting, or record nothing.
-
-The 1121 are mostly Windows-host artefacts rather than upstream breakage -- the
-loader failure above, plus assertions on POSIX path separators
-(`/fake/package/src/a.ts` vs `\fake\package\src\a.ts` in
-`windows-portability.test.js`). They have not been triaged; **they are not known
-to be harmless, only known not to be ours.**
+> **Do not record a projected baseline, and do not treat an un-remeasured one as
+> fact.** A previous revision carried a *projected* ~2932 against a measured
+> 2924, and chasing the gap cost real time. Measure both rows on one tree, in one
+> sitting, or record nothing.
 
 ### Path and projection suites
 
-The 109 `worktree|paths|projection|doctor|markdown-renderer|external-state`
-suites sit at **70 failures**, on this branch and on `main` alike. Before patch 9
-both were at 143.
+The `worktree|paths|projection|doctor|markdown-renderer|external-state` family,
+measured with the strip-types runner on source:
+
+| tree | suites | tests | failed |
+| --- | --- | --- | --- |
+| upstream `v1.15.0` | 126 | 855 | **142** |
+| `LayZeeDK/dev` | 129 | 874 | **90** |
+
+The fork repairs 52 of these, almost all from patch 9's Windows path-comparison
+fix. This is the one column where the fork's effect is legible.
 
 ### Per-suite
 
-The table that used to live here listed four suites as carrying 21/15/3/1
-pre-fork failures. **Patch 9 repaired almost all of them** -- they were one
-Windows path-comparison bug, not upstream breakage:
-
-| Suite | Was recorded | Now |
-| --- | --- | --- |
-| `state-reconciliation-drift.test.ts` | 21 of 68 | **1** of 68 |
-| `markdown-renderer.test.ts` | 15 of 36 | **0** of 36 |
-| `register-hooks-*.test.ts` (3 suites) | 3 of 31 | **0** of 31 |
-| `auto-prompts-fallback.test.ts` | 1 of 10 | **0** of 10 |
-| `doctor-scope-db-unavailable.test.ts` | not recorded | **1** of 32 |
-
-Two known-bad tests worth naming so they are not re-diagnosed:
+Known-bad tests worth naming so they are not re-diagnosed:
 
 - **`checkEngineHealth retains ROADMAP divergence when projection repair remains
   stale`** cannot pass on Windows. It forces a stale flush with
   `chmodSync(dir, 0o555)`, and Windows ignores POSIX mode bits on directories, so
   the flush succeeds and clears the divergence the test expects to survive. A
-  test-design limitation, not a product defect. Fails on `main` too.
+  test-design limitation, not a product defect. Fails on upstream too.
 - **`checkEngineHealth keeps PLAN checkbox divergence after stale projection
-  flush`** is intermittently flaky -- observed failing once in four consecutive
-  runs, asserting `['M001/S01', 'M001/S01/T01']` against an expected
-  `['M001/S01/T01']`. Re-run before investigating.
+  flush`** is intermittently flaky. Re-run before investigating.
 - **`task-completion-compatibility-adapter.test.ts` is flaky when the native
-  addon is ACTIVE**, and the failing test differs from run to run -- observed on
-  `verified publication rejects a passing verdict when verify is no longer the
-  current Kernel head`, `... rejects tracked source mutation after host
-  verification`, `exact stage and publication replay repair projections without
-  duplicate facts`, and `staging normalizes a pending legacy Task ...`. Measured
-  at 1 failure in 4 runs on the **unpatched** base, so it predates this fork.
-  Suspected races around the real projection lock; it does not reproduce under
-  the JS fallback, which is why it only appears once the links are repaired.
-  **A single red run here proves nothing -- repeat it before attributing.**
+  addon is ACTIVE**, and the failing case differs from run to run -- observed on
+  at least five different cases. It does not reproduce under the JS fallback,
+  which is why it only appears once the workspace links are repaired. Measured
+  36/36, 35/36, 36/36 alone. **A single red run proves nothing.**
+- **`trusted marker baselines do not misclassify pending DB renders`**
+  (`gsd-rebuild.test.ts`) is pre-existing; attributed by measurement, above.
 
 ### The procedure, and its limit
 
@@ -510,13 +664,22 @@ node --import ./src/resources/extensions/gsd/tests/resolve-ts.mjs \
 git stash pop
 ```
 
-For a committed patch, revert its files instead and recompile:
+For a committed patch, revert its files instead. The strip-types runner reads
+source directly, so a targeted comparison needs no compile at all:
 
 ```bash
-git checkout <base> -- <the patch's files>
-pnpm run test:compile && pnpm run test:unit:compiled
-git checkout HEAD -- src/
+git checkout v1.15.0 -- <the patch's files>
+node --import ./src/resources/extensions/gsd/tests/resolve-ts.mjs \
+     --experimental-strip-types --test <suite>
+git checkout HEAD -- src packages
 ```
+
+Only reach for `pnpm run test:compile && pnpm run test:unit:compiled` when you
+need the whole-suite row. For a whole-tree revert, note that
+`git checkout <tag> -- src packages` restores modified files but does **not**
+delete fork-added ones; enumerate those separately with
+`git diff --diff-filter=A --name-only v1.15.0 HEAD -- src packages` and remove
+them, or they inflate the "unpatched" row.
 
 **Baseline to avoid misattributing a failure, not to avoid investigating one.**
 Patch 9 is the cautionary tale: the 143-failure baseline had been recorded and
@@ -524,3 +687,8 @@ worked around long enough that it read as normal, while the underlying bug was
 writing real artifacts into the developer's global `~/.gsd`. If a "pre-existing"
 failure sits in code your current patch touches, read it before accepting it --
 that is exactly how patch 9 was found, from a fixture that could not render.
+
+**And a green suite is not evidence either.** Patch 4's site 3 had two suites
+that passed identically with and without the fix, because both built their
+fixtures past the code under test. Before trusting a test you just wrote or just
+repaired, break the source deliberately and confirm the test goes red.

@@ -1,14 +1,17 @@
 # Fork-local patches
 
 Fork-local fixes carried on top of upstream `open-gsd/gsd-pi`, on branch
-`LayZeeDK/dev`, based on tag **`v1.14.0`** (`aa8789b4`).
+`LayZeeDK/dev`, based on tag **`v1.15.0`** (`95f8c3fb`).
 
 Every patch is one commit containing its own tests, written to be cherry-pickable
 into an upstream PR. Nothing here is machine-specific: paths are discovered or
 injected, never hardcoded.
 
-This file is the only fork-only artifact on the branch, and it is deliberately the
-last commit so cherry-picking a patch never drags it along.
+This file is fork-only, and it is deliberately the last commit so cherry-picking a
+patch never drags it along. The other fork-only files (`FORK.md`, `CLAUDE.md`,
+`AGENTS.md`, the `docs/dev/` reports and `plans/`) are likewise added by `docs:`
+or `chore:` commits, never by a patch commit -- that separation, not scarcity, is
+what keeps every patch cherry-pickable.
 
 ## Why this branch exists
 
@@ -30,33 +33,45 @@ Full build, link and rebase procedure: **[FORK.md](FORK.md)**.
 
 | # | Commit | Area | Upstream status |
 | --- | --- | --- | --- |
-| 1 | `cf3658a1` | MCP server PID verification on Windows | not filed |
-| 2 | `9b8d4839` | flat-phase milestone ids | not filed |
-| 3 | `3debdeb8` | external-state projection root | not filed |
-| 4 | `d38bf763` | stamp-insensitive projection drift | not filed |
-| 5 | `b1cb71c2` | POSIX verification shell on Windows | not filed |
-| 6 | `310690f4` | non-array `ask_user_questions` payloads | not filed |
-| 7 | `7925ba85` | validate-milestone prompt contract | not filed |
-| 8 | `8c39929f` | record client capabilities on elicitation failure | not filed |
-| 9 | `ab2d9e6e` | short path components in worktree guards | not filed |
-| 10 | `301a21a3` | read-only engine health checks | not filed |
-| 11 | `da4c30d7` | prose-suffixed `Verify:` lines with a flag | not filed |
-| 12 | `d2f6b378` | `error.cause` in re-wrapped projection failures | not filed |
-| 13 | `358f40db` | headless doctor argument refusal (**breaking**) | not filed |
-| 14 | `9089f9c8` | depth-gate arming paired with a delivery rollback | not filed |
+| 1 | `1139ab47` | MCP server PID verification on Windows | not filed |
+| 2 | `61bd64c8` | flat-phase milestone ids | not filed |
+| 3 | `418081ef` | external-state projection root | not filed |
+| 4 | `bab24536` | unstamped projections in drift comparisons | not filed |
+| 5 | `50665ce9` | POSIX verification shell on Windows | not filed |
+| 6 | `7b0fd7db` | non-array `ask_user_questions` payloads | not filed |
+| 7 | `e4928ce2` | validate-milestone prompt contract | not filed |
+| 8 | `c6ecf27e` | record client capabilities on elicitation failure | not filed |
+| 9 | `eab6712a` | short path components in worktree guards | not filed |
+| 10 | `25dde61e` | read-only engine health checks | not filed |
+| 11 | `301e8271` | prose-suffixed `Verify:` lines with a flag | not filed |
+| 12 | `5356a387` | `error.cause` in re-wrapped projection failures | not filed |
+| 13 | `780a66c7` | headless doctor argument refusal (**breaking**) | not filed |
+| 14 | `3b8cb835` | depth-gate arming paired with a delivery rollback | not filed |
+| 15 | `2f925973` | milestone-lease reentrancy across the process split | not filed |
+| 16 | `3f59fd4b` | DB-authoritative plan-milestone verification | not filed |
+| 17 | `a906814c` | milestone-scoped derivation vs. out-of-scope dependencies | not filed |
+
+Patch 8 spans **two** commits: `d44f1275` (`test(mcp-server): pin elicitation
+behaviour across client capability shapes`) lands `elicitation-capability.test.ts`
+characterising the SDK's actual behaviour, and `c6ecf27e` adds the diagnostic on
+top. They are separate because the first is a pure characterisation of upstream
+code and stands alone; cherry-pick both, in that order.
 
 Plus one fork-local dependency decision that is deliberately **not** a
-cherry-pickable patch -- see [The SDK bump](#the-sdk-bump-0283---03227).
+cherry-pickable patch -- see [The SDK bump](#the-sdk-bump-0283---03229).
 
 One further patch was written and then **withdrawn** -- see
 [Investigated and rejected](#investigated-and-rejected).
 
 Six of these were hardened after a review pass over the whole branch -- see
-[Review pass](#review-pass) for what was found, and what was rejected.
+[Review pass](#review-pass) for what was found, and what was rejected. Patches 15
+and 16 got their own pass, and so did 17 -- see
+[Review pass -- patches 15 and 16](#review-pass----patches-15-and-16) and
+[Review pass -- patch 17](#review-pass----patch-17).
 
 ---
 
-### 1. Verify existing MCP server PID on Windows -- `cf3658a1`
+### 1. Verify existing MCP server PID on Windows -- `1139ab47`
 
 **Symptom.** `Fatal: failed to start -- refusing to start: existing MCP server PID could not be verified`
 
@@ -74,7 +89,7 @@ root-path guard, plus a live child-process probe. The probe test reproduced the
 **Retires** `pai-gsd-pi-update` step 9b, and the cross-reference in
 `gsd-recover-aborted-task` step 4.
 
-### 2. Map flat-phase directories to milestone ids -- `9b8d4839`
+### 2. Map flat-phase directories to milestone ids -- `61bd64c8`
 
 **Symptom.** `Error: Milestone M003 does not exist. Available: 01-requirements, 03-architecture-guardrails-directive-first`
 
@@ -95,7 +110,7 @@ whichever came first.
 
 **Retires** `pai-gsd-pi-update` step 9d.
 
-### 3. Keep external-state stores from escaping to the gsd home -- `3debdeb8`
+### 3. Keep external-state stores from escaping to the gsd home -- `418081ef`
 
 **Symptom.** `could not lock projection root identity: ... os error 32 at createInitialProjectionDirectory`, plus a second, silent failure.
 
@@ -124,38 +139,68 @@ round-trips. Proven load-bearing by disabling the boundary and re-running.
 global `~/.gsd` and adopting the user profile) arriving by a different route: a
 comparison form that did not expand Windows 8.3 short components.
 
-### 4. Compare projections without the state-version stamp -- `d38bf763`
+### 4. Tolerate unstamped projections in drift comparisons -- `bab24536`
 
-**Symptom.** `External modeled edit detected` hard-pausing `gsd auto` on work gsd
-had produced itself.
+**Symptom.** `gsd doctor` reporting `N file(s) drifted -- run /gsd sync` on a
+repository with no content drift, and `removeOwnedPlanProjection` refusing to
+delete plan files it owned, stranding them on disk.
 
 **Cause.** `writeAndStore()` appends a `<!-- gsd:state-version=... -->` line and
-stores the stamped bytes, while `workflow-projections.ts` writes the same logical
-content unstamped and refreshes neither the DB row nor the marker. Four
-comparison sites hashed raw bytes. `markdown-renderer.ts` already documented the
-intended contract -- this restores it rather than changing policy.
+mints both the artifact row and the `.compat.json` baseline from those stamped
+bytes. A projection that is on disk UNSTAMPED against a stamped baseline
+therefore compares unequal to itself, and two comparison sites hashed raw bytes
+on both sides.
+
+**Migration tolerance, not a live-writer fix -- and this took three tries to state
+correctly.** The stamp arrived in `v1.13.0`, so the mismatch comes from a disk
+copy rendered before that, or one left at a legacy path by a layout migration
+while the artifact was re-rendered at the new one. **No current writer produces
+an unstamped managed projection.** Earlier editions of this section, and of the
+commit message, blamed `workflow-projections.ts renderPlanProjection()` -- which
+has had no production caller since before `v1.14.0` (see **B8**) -- and
+`renderSummaryProjection()`, which now routes through `writeTaskSummaryProjection`
+and therefore stamps and records. Both citations were inherited, never checked,
+and wrong.
+
+**Scope, and what was withdrawn at the v1.15.0 rebase.** This patch now changes
+only the two READ sites: `formatCompatHealthLine` and `removeOwnedPlanProjection`.
+It originally also normalized the WRITE side -- minting the marker sha and the
+detector's `actualSha` from stripped bytes -- which redefined what the shared
+value *means*. v1.15.0 made that untenable and, on measurement, unnecessary:
+
+- Nothing can produce a stamp-only mismatch. `stampProjectionContent` and
+  `recordProjectionWrite` are each called from exactly one place, both inside
+  `writeAndStore`, on the same bytes.
+- The one scenario that looked like a live cause -- `renderPlanProjection`
+  overwriting a plan -- is unreachable dead code, and its output differs by
+  **content** anyway (170 bytes against 366), which no amount of stamp-stripping
+  reconciles. Closed as **B8**.
+- Upstream added `gsd-rebuild.test.ts` "projection baselines retain the exact
+  rendered intent", asserting the raw contract outright.
+- Two new upstream consumers assumed raw: a stripped baseline made
+  `projection-mutation-guard.ts` quarantine a copy on **every** managed `.gsd`
+  write, and a stripped `actualSha` made `projection-observation.ts` drop the
+  quarantine copy for a genuinely hand-edited projection -- silent data loss on
+  the path `/gsd sync` and `/gsd recover` exist to protect.
+
+Measured on the real functions: with the write side stripped, an external edit to
+a stamped projection yields 0 preserved entries and no quarantine directory; with
+it raw, 1 entry and the directory present. Site 2 is load-bearing in the other
+direction -- reverting it strands the legacy unstamped plan file. See
+[FORK.md](FORK.md#when-a-patch-redefines-a-shared-value).
 
 **Deliberately excluded.** `.planning` projections are never stamped and their
 sha is read raw everywhere else, so the `.gsd` map opts in explicitly. A test
 pins that.
 
-**Legacy baselines, and why no migration.** A marker baseline written *before*
-this change stores a sha of stamped bytes, which stripping can never reproduce.
-The reconcile detector heals itself -- `external-markdown-edit.ts` falls back to
-`dbProjectionMatches` -- but the doctor compat-health line has no DB to fall back
-to, so it would report every stamped projection as `N file(s) drifted -- run
-/gsd sync` on a healthy repo immediately after upgrading, until something
-re-rendered.
-
-`countDrifted` therefore accepts the **raw** sha as well as the stripped one for
-the `.gsd` map. That cannot mask real drift -- edited content matches the
-baseline neither stripped nor raw, and a test pins that -- and it makes the
-skill's one-time `.compat.json` migration unnecessary rather than merely
-un-ported.
+**Why the health line accepts either form.** Raw is the ordinary match for a
+projection written and baselined by `writeAndStore`; stripped covers the
+unstamped-on-disk case. Accepting both cannot mask real drift -- edited content
+matches the baseline neither stripped nor raw, and a test pins that.
 
 **Retires** `pai-gsd-pi-update` step 9e and `verify-stamp-insensitive-drift.mjs`.
 
-### 5. Run verification commands in a POSIX shell on Windows -- `b1cb71c2`
+### 5. Run verification commands in a POSIX shell on Windows -- `50665ce9`
 
 **Symptom.** `post-unit-finalize-end` with `reason: "verification-abort"`
 immediately after a clean `unit-end` -- the task passed, the gate failed it.
@@ -186,7 +231,7 @@ PATH prefix.
 
 **Retires** `pai-gsd-pi-update` step 9a; `gsd-recover-aborted-task` step 6.
 
-### 6. Tolerate non-array `ask_user_questions` payloads -- `310690f4`
+### 6. Tolerate non-array `ask_user_questions` payloads -- `7b0fd7db`
 
 **Symptom.** `Extension ".../gsd/index.js" error: questions.find is not a function`, aborting the whole `/gsd` workflow.
 
@@ -210,7 +255,7 @@ returns the first candidate that yields questions.
 
 **Adopts** the previously-unapplied `patch-questions-normalizer.mjs`.
 
-### 7. Make the validate-milestone prompt match the tool contract -- `7925ba85`
+### 7. Make the validate-milestone prompt match the tool contract -- `e4928ce2`
 
 **Symptom.** `planned <class> verification requires current structured database evidence; verificationClasses prose cannot authorize Milestone validation`
 
@@ -225,16 +270,31 @@ recorded revision must still be current when the tool compares it. The
 instructions, because pasting three transcripts drove the agent into a
 zero-tool-call retry and `MAX_ZERO_TOOL_RETRIES = 1` makes that terminal.
 
+**Completed at the v1.15.0 rebase.** The first cut documented four fields. The
+entry schema in `bootstrap/db-tools.ts` requires **eleven** and is
+`additionalProperties: false`, so a partial list fails a correctly-followed run
+just as hard as no list at all -- it only moves the rejection to a different
+field. Worse, the fourth documented field was `summary`, which the schema has
+never accepted. The prompt now carries every required field plus the two optional
+ones, a JSON example, and an explicit statement that unlisted keys are rejected.
+
 **Test caveat.** This is a contract test between the shipped prompt and the
 tool's accepted payload -- it renders the prompt through the real loader and
 asserts the required fields are documented. It cannot verify the prompt reads
 well, only that the two artifacts agree.
 
+It now asserts **both** directions -- every non-Optional field is named, and the
+JSON example introduces no key the schema would reject -- and its field list is
+pinned to the schema rather than to a chosen subset. Naming only some required
+fields is precisely how the prompt and the schema drifted apart while a green
+test said otherwise; a contract test that checks one end of the contract is not
+a contract test.
+
 **Adopts** the previously-unapplied `apply-validate-milestone-evidence-prompt.mjs`.
 
 ---
 
-### 8. Record client capabilities when elicitation fails -- `8c39929f`
+### 8. Record client capabilities when elicitation fails -- `c6ecf27e`
 
 **Why.** The withdrawn patch below was built on the client's **raw** initialize
 params, which do not show what the SDK server concluded. This records the
@@ -275,7 +335,7 @@ fails. Tests cover each of those.
 
 ---
 
-### 9. Expand short path components in worktree guard comparisons -- `ab2d9e6e`
+### 9. Expand short path components in worktree guard comparisons -- `eab6712a`
 
 **The most consequential patch on this branch, and it was not on the backlog.**
 It was found while re-verifying B1, because B1's own fixture could not render.
@@ -348,7 +408,7 @@ pre-existing failures in that same suite.
 short temp path, with a `.gsd/` but no `.git`, `gsd headless doctor --json`
 reports that directory as `basePath` rather than `C:\Users\<user>`.
 
-### 10. Keep engine health checks read-only without repair -- `301a21a3` (B1)
+### 10. Keep engine health checks read-only without repair -- `25dde61e` (B1)
 
 **Symptom.** `gsd headless doctor` re-rendered projections and printed
 `Fixes applied:` from what the operator asked to be a diagnostic.
@@ -380,7 +440,7 @@ that merely disabled the re-render would keep the new test green and break its
 **Retires** `gsd-recover-aborted-task`'s warning that a diagnostic doctor run
 mutates state.
 
-### 11. Reject prose-suffixed verify lines that carry a flag -- `da4c30d7` (B2)
+### 11. Reject prose-suffixed verify lines that carry a flag -- `301e8271` (B2)
 
 **Symptom.** A `Verify:` line that is plainly a sentence was handed to the shell,
 failing a task whose substance had already passed.
@@ -415,7 +475,7 @@ Verified against the built `dist/` as well as source.
 **Retires** the `gsd-recover-aborted-task` step for a prose `Verify:` line
 executed as a shell command. Reproduces on every platform, unlike patch 5.
 
-### 12. Keep `error.cause` in re-wrapped projection failures -- `d2f6b378` (B5)
+### 12. Keep `error.cause` in re-wrapped projection failures -- `5356a387` (B5)
 
 **Symptom.** `Task completion PLAN projection failed: native projection root
 identity locking failed` -- with the actionable `os error 32` nowhere in sight.
@@ -490,7 +550,7 @@ shape matches the real one.
 **Retires** the `gsd-recover-aborted-task` step 5-vs-5b dance, whose whole purpose
 was recovering the discarded cause by hand.
 
-### 13. Refuse headless doctor args that cannot be honoured -- `358f40db` (B6)
+### 13. Refuse headless doctor args that cannot be honoured -- `780a66c7` (B6)
 
 **BREAKING.** See below.
 
@@ -541,7 +601,7 @@ with no doctor report and exit 1, `gsd headless doctor fix` is refused, and
 **Retires** the `gsd-recover-aborted-task` step that has the operator quote the
 subcommand to work around the dropped argv.
 
-### 14. Pair depth-gate arming with a delivery rollback -- `9089f9c8`
+### 14. Pair depth-gate arming with a delivery rollback -- `3b8cb835`
 
 **Symptom.** Saving a milestone `CONTEXT` was impossible from a client without
 form elicitation, and the *first* failed attempt bricked the whole session --
@@ -655,12 +715,478 @@ on model compliance, which is exactly what a mechanical gate exists not to rely
 on). Deleting `.gsd/runtime/write-gate-state.json` remains the documented
 stopgap; it was already the supported reset.
 
+### 15. Make the milestone-lease reentrancy check survive the process split -- `2f925973`
+
+**Commit order is load-bearing: 15 before 16, and 16 must not be cherry-picked
+upstream without 15.** Patch 16 alone converts today's false success into three
+retry turns plus a pause on every auto-mode plan-milestone, because the tool is
+still lease-blocked.
+
+**Symptom.** A milestone that reaches `plan-milestone` inside `/gsd auto` can
+never be planned by that run. Every nested `gsd_plan_milestone` is rejected as a
+conflict against its own orchestrator's lease. Reported against consumer project
+`ngx-foundation-sites`, milestone `M002`
+([incident report](docs/dev/2026-08-11-plan-milestone-lease-self-deadlock.md)).
+
+**Cause.** `executePlanMilestone` proved reentrancy with in-process state
+(`isAutoActive()`, `autoSession.workerId`) and `holder.pid === process.pid`. The
+orchestrator spawns a child `claude`, which spawns the workflow MCP server, so
+neither can ever hold. `claimMilestoneLease`'s takeover `EXISTS` clause carries
+the same assumption in SQL, requiring equal host **and** pid **and** project
+root, so the one-shot claim would reject the call a second time.
+
+`/gsd next` is the same machinery -- `startAutoDetached(..., { step: true,
+milestoneLock })`, a fire-and-forget promise in the *same* process -- so it
+registers a worker, claims the lease, and hit the identical deadlock.
+
+**Fix.** Carry the orchestrator's worker id to the descendant that serves the
+tool call over the per-turn env channel GSD already uses for the
+milestone-status observation token.
+`injectMilestoneStatusObservationToken` becomes `injectWorkflowChildEnvTokens`
+and applies the same delete-then-set-if-present treatment to
+`GSD_AUTO_WORKER_ID`. Extending the one existing call rather than adding a second
+is deliberate: it assigns `sdkOptions.env` wholesale, so a second call would
+clobber the first key.
+
+**Both halves of that helper are needed.** `stream-adapter.ts` removes the
+workflow server from the SDK-injected `mcpServers` when the project already
+declares it in `.mcp.json` -- which the reported project does -- in which case
+the `claude` CLI launches the server itself and plain inheritance from
+`sdkOptions.env` is the only channel.
+
+The SQL is deliberately **not** edited. Relaxing a shared takeover predicate
+would change every lease claimant; instead the reentrant peer skips the claim
+entirely. That leaves `workerId`/`acquiredToken` null, so the `finally` releases
+nothing and the orchestrator keeps owning and refreshing its own lease -- no
+mid-plan expiry window opens.
+
+**Per-dispatch, never a global env var.** Because the value is injected per
+dispatch and deleted when no worker is active, the orchestrator's own
+`process.env` is never mutated. That removes the whole class of mirroring bugs a
+global would have introduced: no cleanup-site enumeration to get wrong (there
+are five places `s.workerId` is nulled, including a plan-milestone-specific
+setup-race pause), no survival past a SIGTERM handler that nulls the worker
+without exiting, no inheritance by parallel workers that spread `...process.env`,
+and no stale id left behind when `registerAutoWorker` throws on an unavailable
+DB. No `auto.ts`, `auto/session.ts` or `verification-gate.ts` change is needed.
+
+**Deliberately not compared: `project_root_realpath`.** The orchestrator
+registers with `scope.workspace.projectRoot` while the MCP server's root comes
+from `GSD_WORKFLOW_PROJECT_ROOT`; requiring equality would re-wedge worktree
+sessions, and the per-dispatch channel already means the id only reaches this
+orchestrator's own descendants. The positive test therefore registers its holder
+against the fixture base rather than reusing the conflict fixture's
+`other-project` root -- reusing that would assert a cross-project lease bypass,
+locking in the one comparison this patch drops.
+
+**An inviting wrong turn: `buildWorkflowLaunchEnv`.** Its output is written
+verbatim into the project's `.mcp.json` by `ensureProjectWorkflowMcpConfig`, so a
+per-session id threaded there would be **persisted to disk and go stale**. That
+is the reason the in-memory seam is the right one.
+
+**The inherited id is trusted only when auto is NOT active in this process.**
+`ourAutoWorkerId` is `activeAutoWorkerId ?? (isAutoActive() ? null :
+inheritedAutoWorkerId)`. A plain `??` fallback reads better and is wrong: with
+auto active and the worker row detached by the setup-race pause, an inherited id
+matching the holder made `isOurAutoLease` true, which skips the whole
+`holder?.status === "active" && !isOurAutoLease` block -- *including* its
+documented "active auto without a worker row cannot reclaim here. Fail closed
+instead of planning against a lease we do not own" return. The nested dispatch
+then planned against a lease it did not own, claimed nothing, and released
+nothing. In the workflow MCP server -- the entire point of the env hop --
+`isAutoActive()` is always false, so gating on it costs the fix nothing.
+
+**`status = 'active'` is not liveness, so the inherited-id path checks the
+holder's process.** Only `stopAuto` and the janitors ever clear that column, so a
+SIGKILLed or suspended orchestrator leaves an `active` worker row *and* a held
+lease for up to `LEASE_TTL_SECONDS` (60). Trusting the column alone let a
+descendant plan with no live lease owner -- and the workflow MCP server is a
+*grandchild* (SDK -> `claude` -> server), which Windows does not reliably reap, so
+it can outlive the orchestrator. If the operator restarted `gsd auto` after the
+lease expired, two planners could overlap. Before this patch that path returned a
+conflict, so the window is one this patch opened.
+
+The guard is the same mechanism as `isDeadLocalLeaseHolder` (`auto/loop.ts`) --
+`process.kill(pid, 0)`, with `EPERM` meaning alive-but-not-signallable -- minus
+that helper's `project_root_realpath` comparison, which is precisely what this
+patch must not require. It is only meaningful because the same conjunct already
+requires `holder.host === hostname()`. **PID reuse can still read as alive**,
+exactly as in that helper; the DB write is additionally guarded by the
+`workflow.milestone.plan` domain-operation ledger.
+
+The in-process path is untouched: `activeAutoWorkerId !== null` short-circuits
+ahead of it, so this only ever constrains an inherited id.
+
+**Accepted limitation, with the trust boundary stated accurately.** Two parts,
+and the second was overclaimed in the first draft of this section:
+
+- The worker id is echoed verbatim to every blocked caller by
+  `milestoneLeaseConflictResult`, so it is not a secret: anyone who can set env
+  vars on a process that reaches the DB can assert it.
+- `sdkOptions.env` is inherited by the child `claude` and therefore by
+  **everything that child spawns**, including Bash-tool subprocesses -- not only
+  the workflow MCP server. An earlier wording here ("the per-dispatch channel
+  already means the id only reaches this orchestrator's own descendants") is
+  literally true but was used to argue a narrow boundary; "descendant of the
+  dispatch" is much wider than "the process serving the tool call". A `gsd`
+  invoked from a Bash tool call inside the turn does inherit the id and can then
+  satisfy the predicate.
+
+Neither is a regression. The milestone lease is single-host advisory coordination
+between the user's own sessions ([COORDINATION](src/resources/extensions/gsd/docs/COORDINATION.md)), and any
+actor with shell access can already write the DB directly. A per-session nonce in
+the runtime KV would be equally readable, so it buys nothing. Narrowing the
+inherited-id path by comparing the canonical milestone root was considered and
+rejected for the same reason `project_root_realpath` is not compared: it
+re-wedges worktree sessions, which is the defect this patch exists to fix.
+
+**Proving the env hop, and how not to.** Nothing in the tree proved the id
+reaches the process serving the tool call; the observation-token test simulates
+propagation in-process. Two probe channels that do **not** work from the MCP
+server: `logWarning` (its `appendNotification` returns early while `_basePath` is
+null, and that process never calls `initNotificationStore`), and `debugLog`
+(no-op unless `GSD_DEBUG`/`--debug` armed that process). Read it from the DB
+instead -- it is unambiguous and needs no probe at all:
+
+| | value |
+| --- | --- |
+| lease held by | `auto-LGBN-Surface-25664-54c89fae`, pid 25664, heartbeat 11:30:43 |
+| held from / to | 11:24:43.067Z / 11:31:43.172Z |
+| `gsd_plan_milestone` returned success | **11:31:05.984Z** -- inside that window |
+| lease afterwards | same worker, **no takeover row** |
+
+Before the patch the same milestone was blocked across four conflicting calls
+over 15 minutes; after it, the first call persisted five real slice rows.
+
+**Tests.** Two `workflow-tool-executors` cases (plans through its own
+orchestrator's lease without stealing it or bumping the fencing token; still
+refuses an unrelated inherited id) plus the pre-existing env-unset conflict case,
+and one `stream-adapter` case asserting both env channels carry the id when auto
+is active and that a stale inherited value is deleted when it is not. Proven
+load-bearing: dropping the `!reentrantAutoLease` guard turns the positive case
+red.
+
 ---
 
-## The SDK bump 0.2.83 -> 0.3.227
+### 16. Make plan-milestone verification DB-authoritative -- `3f59fd4b`
+
+**Symptom.** The same reported unit finalized `completed` /
+`artifactVerified: true` with nothing durable written. `renderRoadmapFromDb`
+logged `skipped unplanned milestone M002 (zero slices, empty vision) -- refusing
+to write a stub ROADMAP` **1.8 s after** the `unit-end`.
+
+**Cause.** `artifactVerified: true` was computed honestly from a real file.
+Blocked on the lease for 15 minutes, the agent hand-wrote `02-ROADMAP.md` against
+its own prompt (`prompts/plan-milestone.md` step 5: "Do **not** write
+`{{outputPath}}`, `ROADMAP.md`, or other planning artifacts manually; the tool
+owns rendering and persistence"), nothing enforced that instruction, and
+file-only verification accepted the forgery. Reconciliation later removed the
+unbacked projection, which is why a post-hoc `ls` found nothing and the mechanism
+looked unpinnable.
+
+`persistMilestonePlan` already states the contract in `renderPlanArtifacts`'
+catch -- "the DB is the authority and ROADMAP.md is only a projection" -- and
+commits slice rows before the render. Verification simply never consulted it, so
+any file that parses as a roadmap counted as proof of planning: a hand-written
+one, a stale one, a leftover from a failed render.
+
+**Fix.** `hasPlannedMilestoneSliceRows` runs before the existing projection and
+slice-count checks, so **both authorities must agree**.
+
+- *Refresh-on-negative.* The orchestrator's long-lived handle can be stale with
+  respect to rows the workflow MCP server just committed -- `db/engine.ts`
+  documents that exact scenario, and the plan-slice branch guards its own
+  cross-process read the same way. Only a zero-row read can be a false negative,
+  so it reconnects only to confirm one.
+- *Fail-soft on every failure*, matching plan-slice, which falls back to parsing
+  the file when the refresh fails. A wedged `/gsd next` is the worse outcome, and
+  the projection check still runs either way. (Rejected: failing closed to match
+  the `validate-milestone` and `execute-task` tails. Those fail closed because
+  they have no file evidence to fall back on; plan-milestone does.)
+- *A `base` guard, because the DB handle is process-global.* The predicate reads
+  whichever handle is open, and every caller has a base path, but nothing
+  confirmed the two agree. Without the guard, a handle belonging to a *different*
+  project returns zero rows and that is a hard block -- the documented fail-soft
+  covered only "no DB open" and "throws". So it now returns `true` when the open
+  path is not this base's. The sibling DB branches in `verifyExpectedArtifact`
+  (`parallel-research`, `execute-task`, `validate-milestone`, `plan-slice`) all
+  read the global handle keyed on milestone id alone and two of them fail
+  *closed*, so a cross-project read there is worse; they are left alone as
+  pre-existing, out-of-scope behaviour.
+
+**The `base` guard has a trap that made three tests lie, worth reading before
+touching it.** Compare the two paths with a bare `!==` and it reports a mismatch
+for the *same file*: `expectedWorkflowDbPathForBase` resolves through `gsdRoot`
+(realpath, long form) while `getWorkflowDatabasePath` returns the raw path it was
+opened with, which under `mkdtempSync` is the 8.3 short form
+(`C:\Users\LARSGY~1\...`). The guard then always fell soft and **silently
+disabled this entire patch**, turning the three "must reject" cases green. This is
+patch 9's bug class exactly. Measured on a throwaway fixture:
+
+| | value |
+| --- | --- |
+| opened / `getWorkflowDatabasePath()` | `C:\Users\LARSGY~1\...\.gsd\gsd.db` |
+| `expectedWorkflowDbPathForBase(base)` | `C:\Users\LarsGyrupBrinkNielse\...\.gsd\gsd.db` |
+| bare `===` | **false** -- same file |
+| normalized | **true**, and a foreign base still differs |
+
+The comparison is `isSameFilesystemPath` (`external-state-store.ts`), not two
+`normalizeRealPath` calls: it realpaths, unifies separators **and** case-folds on
+win32, its own doc comment is about this exact trap, and it is deliberately
+dependency-light because the projection-write fence already sits on it. It also
+keeps the two sides comparable on its `resolve()` fallback, which matters because
+`probeGsdRoot`'s last step returns `join(rawBasePath, ".gsd")` un-realpathed -- so
+when `.gsd` is unresolvable the two sides otherwise carry different shapes and
+fail open.
+
+The failure direction is what makes this dangerous: a false mismatch fails
+*open*. **And the obvious test does not catch it portably.** The three
+reject/pass cases only go red under a bare `===` because `tmpdir()` on this host
+is an 8.3 path; on Linux/macOS CI there is no short-name divergence, so a
+de-normalized compare still matches and the bug ships green. The pin for that is a
+separate case that opens the DB through an equivalent-but-textually-different path
+(a redundant `.` segment, built by concatenation because `join`/`resolve` collapse
+it), which diverges on every OS.
+
+**The refresh must not be the bare `refreshWorkflowDatabaseFromDisk`.** That
+function is a close-then-reopen (`db/engine.ts`), and a failed reopen leaves the
+process-global handle `null` **for the rest of the process**. Failing soft on that
+hides a dead handle from every later caller -- and `doctor --fix` deletes every
+completed-unit key whose artifact does not verify, while the sibling branches fail
+*closed* on `!isDbAvailable()`. So one zero-row plan-milestone whose reopen loses
+a race (an `EBUSY` against the workflow MCP server mid-`wal_checkpoint`) could
+cascade into pruning completion records for units that are genuinely complete,
+inside a bare `catch {}` that surfaces nothing. `ensureWorkflowDbForBase(base,
+{ refresh: true })` reopens by path when the refresh fails, so the handle is
+repaired rather than abandoned, and it returns false when the DB file is absent.
+
+**Excluding the fabricated `S00-blocker` row closes a hole rather than opening
+one.** The #4378 escape hatch does not run through artifact verification:
+`writeBlockerPlaceholder` writes a stub roadmap with zero slice entries, which
+the projection check already rejects, and the hatch works by letting
+`deriveState` see `activeMilestoneSlices.length > 0`. Counting the row would
+instead mean that after any blocker placeholder, a later hand-written
+slices-bearing `ROADMAP.md` verifies as "planned" forever -- precisely the
+incident. The sentinel is now one exported constant used by both the writer and
+the check, so they cannot drift.
+
+**The retry prompt had to name the DB, not the file.** Without this the patch's
+stated outcome is false. `artifactValidationKind` returns `null` for
+`plan-milestone`, so `describeArtifactVerificationFailure` fell through to
+"`<path>` exists but did not satisfy the plan-milestone completion contract". That
+string is the only thing the agent sees; the DB reason goes to a `logWarning`,
+i.e. notifications. Pointed at the file it had just written, the
+highest-probability repair is to rewrite it -- re-forging the same forgery. The
+new message names the DB and `gsd_plan_milestone`, worded clear of the four
+`isDeterministicPolicyError` marker phrases for the same reason the write-gate
+block below is rejected.
+
+> **Correction, from the review pass.** An earlier version of this paragraph said
+> the agent would re-forge the file "three times
+> (`MAX_ARTIFACT_VERIFICATION_RETRIES`), then pausing". That constant is not the
+> operative budget. `decideVerificationRetry`
+> (`auto/verification-retry-policy.ts`) hashes `failureContext` and returns
+> `pause` / `duplicate-failure-context` as soon as a retry repeats the previous
+> hash, so a **constant** message buys exactly one re-dispatch and then pauses
+> auto-mode. Both the old and the new message are constant, so both pause on
+> attempt 2 -- the change does not reduce a retry count, and claiming it did
+> overstated the harm. The message change stands on its own merit: one
+> re-dispatch pointed at the DB and `gsd_plan_milestone` can succeed, whereas one
+> re-dispatch pointed at the file it just wrote cannot. No test covers the
+> pause-on-duplicate interaction for this message.
+
+**`verifyScopedPlanMilestoneArtifact` gets the same check.** It has no production
+callers yet -- only `validator-scope-parity.test.ts` -- but `guided-flow.ts`
+names its wrapper as the migration target, so leaving the inner helper divergent
+just plants the same bug for its first caller.
+
+**Behaviour change worth naming.** `doctor-runtime-checks.ts`
+(`orphaned_completed_units`) calls `verifyExpectedArtifact` and is
+`fixable: true`; its fix deletes the completed-unit key. Any project with a
+roadmap-on-disk / zero-rows milestone therefore gains a warning, and
+`gsd doctor --fix` will drop its `plan-milestone` completed key so auto
+re-dispatches planning. That is the correct diagnosis, but it is a change in the
+command used during wedge recovery.
+
+**Rejected: a write-gate HARD BLOCK on hand-written `ROADMAP.md`.** Blocking the
+raw `Write` at source looks like the obvious third patch and is a trap.
+`shouldRecordToolInvocationError` classifies by message *shape*, not by tool, so a
+refusal worded like the neighbouring CONTEXT gate ("HARD BLOCK: ... This is a
+mechanical gate") is recorded as `s.lastToolInvocationError`, matches
+`isDeterministicPolicyError`, and drives `writeBlockerPlaceholder` -- which for
+`plan-milestone` writes the stub roadmap `renderRoadmapFromDb` refuses to write,
+inserts a fabricated `S00-blocker` slice with status `complete`, and advances the
+pipeline. Worse than the reported bug: the milestone becomes permanently
+"planned" with one fake complete slice and auto-mode executes a milestone with no
+plan. Dodging all four marker phrases avoids the fabrication but leaves a
+landmine for the next maintainer who normalises the message to house style, in a
+file upstream changes often, and buys nothing this patch does not deliver.
+
+**Two adjacent facts, both out of scope.** That fabrication path is reachable
+today for any deterministic policy error raised during a `plan-milestone` unit.
+And the fabrication is skipped entirely when `hasAdoptedMilestoneHistory(mid)`,
+so in the adopted-history branch a plan-milestone unit can never verify -- before
+or after this patch.
+
+**Tests.** Four new DB cases in `plan-milestone-artifact-verification.test.ts`
+(roadmap + real rows -> true; roadmap + zero rows -> false, the incident; roadmap
++ only an `S00-blocker` row -> false; zero-slice roadmap + real rows -> false,
+the projection check still bites), each closing the database in `t.after` so the
+four pre-existing no-DB cases stay order-independent. One diagnostic case via the
+`_describeArtifactVerificationFailureForTest` seam. Two
+`recovery-verify-logs.test.ts` cases passed only because they were declared
+before the DB-opening cases in the same file; they now close the database
+explicitly rather than depending on declaration order.
+
+**End to end.** In the reported project, `gsd doctor` went from one ERROR
+(`M002: Milestone M002 is missing its ROADMAP.md file`) to none, with **no**
+`orphaned_completed_units` warning -- because M002's planning is now genuinely
+backed by slice rows. `gsd headless query` shows M002 `active`, five slices, no
+blockers, next dispatch `research-slice M002/S01`.
+
+---
+
+### 17. Judge milestone dependencies against all milestones under a scope lock -- `a906814c`
+
+**Symptom.** A `queued`/`planned` milestone could not be reached from any menu.
+`/gsd auto M002` and `/gsd next M002` both rendered the idle three-option menu --
+"Create next milestone" / "Quick task" / "Not yet" -- above the line "Resolve
+milestone dependencies before proceeding.", and the only forward action mints a
+*new* milestone ID. Naming `M002` on the command line appeared to have no effect.
+Reproduced twice in `ngx-foundation-sites-gsd-pi`, at 0 slices and again at
+`planned` with 5 slices and 17 tasks, so it is not specific to an empty milestone
+([incident report](docs/dev/queued-milestone-not-resumable.md)).
+
+**Cause.** Not the menu. Naming a milestone exports `GSD_MILESTONE_LOCK`
+(`commands/handlers/auto.ts` -> `auto.ts:441`), and `deriveStateFromDb` filters the
+milestone list down to the locked ID -- correct, that is the point of the lock --
+then built `completeMilestoneIds` **from that filtered list**. M001 was not in it,
+so M002's satisfied `depends_on: ["M001"]` read as unmet, M002 was registered
+`pending` rather than promoted, nothing became active, and phase fell to `blocked`.
+`guided-flow.ts` shows the idle menu precisely because `activeMilestone == null`.
+So passing the milestone ID is what *caused* the dead end, which is why it read as
+an unrelated menu gap.
+
+The live fixture, with the dependency plainly satisfied:
+
+```
+M001|complete|[]
+M002|planned|["M001"]
+M003|complete|[]
+```
+
+**Fix.** `buildCompletenessSet` reads the unfiltered list while
+`buildRegistryAndFindActive` keeps the scoped one. Completeness is a whole-project
+fact; the registry scoping is the contract and is unchanged. `parkedMilestoneIds`
+widens with it and is inert -- the registry loop only visits scoped rows.
+
+This also **closes a divergence rather than inventing a rule.**
+`getActiveMilestoneId` (`state.ts`) already implements the intended lock
+semantics: under a lock it returns the locked milestone if it is neither closed nor
+parked, with no dependency check at all. Pre-patch, one process had
+`getActiveMilestoneId` answering `M002` and `deriveStateFromDb` answering `null`.
+
+**Two further defects on the same path.**
+
+- *`handleNoActiveMilestone` inferred "unmet deps" from an entry merely having
+  `dependsOn`.* The `queued-shell` push attaches deps on a branch only reachable
+  once `depsUnmet` was already false, so a content-less shell with *satisfied* deps
+  reported "Resolve milestone dependencies before proceeding." instead of the #1524
+  orphan-row guidance and its `/gsd doctor fix` recovery path. Fixed at the
+  inference, not the data: blanking `dependsOn` from the push would leave the wrong
+  heuristic in place, and `registry[].dependsOn` is a shared surface --
+  `guided-flow-queue.ts` maps it into the queue-reorder UI, where `liveDeps` drives
+  redundant-dep detection and removal.
+- *The blocker named every dep, not the unmet ones.* `M003 depends_on
+  ['M001','M002']` with M001 complete emitted "waiting on unmet deps: M001, M002",
+  sending the user after a milestone that needs nothing. Pre-existing, and exactly
+  the same presence-is-not-unmetness confusion one level down. The #1524 message
+  likewise now reads "no unmet dependencies": with the filter fixed, a shell whose
+  deps are all complete reaches that branch for the first time.
+
+**The corruption was durable, and that is the larger half of the patch.**
+`guided-flow.ts` rebuilds the project's global `.gsd/STATE.md` from the scoped
+derivation before every dispatch, which is why the fixture's STATE.md listed one
+milestone and a false blocker -- and later sessions and agents bootstrap from that
+file. New `saveStateProjection` (doctor.ts) declines the write, and **four** writer
+families route through a guard, not the one the report implicated:
+
+| writer | reached under a lock by |
+| --- | --- |
+| `rebuildState` | seven call sites: auto post-unit / pre-dispatch / resume, `doctor-proactive`, `gsd_skip_slice` |
+| `updateStateFile` | `runGSDDoctor(fix:true)` at `auto.ts:2975`, after `captureMilestoneLockEnv` |
+| `guided-flow.ts` x2 | the pre-dispatch rebuild that corrupted the fixture, plus the discuss path |
+| `renderStateProjection` | `complete-task` / `complete-slice`, every unit, via `renderMilestoneShellProjections` |
+| `doctor-runtime-checks` staleness repair | same `runGSDDoctor(fix:true)` path |
+
+`rebuildState` is guarded **inside the function**, not at its call sites -- there
+are seven and the list grows. The last two are not in the plan for this patch and
+were added because without them its own acceptance criterion ("after a scoped run
+STATE.md still lists M001, M002 and M003") is false: the doctor one would report a
+false `state_file_stale` under a lock and then repair it *into* the truncated
+projection, and `renderStateProjection` fires on every completed unit.
+
+**The guard is exists-conditional, not lock-only, and that distinction is
+load-bearing.** A lock-only guard reads as obviously correct and is wrong: an
+*absent* STATE.md holds nothing worth protecting, two callers exist purely to
+create it (doctor's `state_file_missing` fix, `doctor-proactive`'s pre-dispatch
+rebuild), and worktree teardown (`clearProjectRootStateFiles`) deletes the
+project-root copy under a lock. Declining there would leave the file missing for a
+whole scoped run -- dropping the STATE section from every dispatched prompt via
+`inlineGsdRootFile` -- while `doctor-proactive` still pushed "rebuilt missing
+STATE.md before dispatch" into `fixesApplied` and notified the operator of a repair
+that never happened, on every unit. So `rebuildState` now returns whether the write
+happened and `doctor-proactive` honours it. For the same reason
+`state_file_missing` **detection** stays unguarded: existence is a scope-independent
+fact, staleness is not.
+
+Skipping rather than re-deriving unscoped leaves STATE.md stale for the duration of
+a scoped run. Stale-but-true beats fresh-but-wrong, and the next unscoped `/gsd` or
+`gsd doctor` rewrites it. The upgrade path, if staleness ever bites, is to
+re-derive with the lock env temporarily cleared, the way
+`capture`/`restoreMilestoneLockEnv` already does at session boundaries.
+
+**The legacy markdown path carries the same two derivation defects and is
+deliberately untouched.** `_deriveStateImpl` truncates `milestoneIds` to the lock,
+builds its own `completeMilestoneIds` from the truncated list, evaluates `depsUnmet`
+against it, and repeats the dependsOn-presence heuristic. It is unreachable from
+the live derive seam (which fails closed to `buildDbUnavailableState`) and its
+deletion is the timebox-gated task T022. Named here so the next rebaser does not
+read it as a missed hunk.
+
+**Deliberately not built: the reported fix shape.** The report proposed a "Resume
+queued milestone `<id>`" menu action in both idle-menu blocks. With
+`activeMilestone` non-null the idle menu is never reached, so no menu action is
+needed. One boundary remains, and it is the promotion policy rather than this
+patch: for a genuinely *phantom* queued row -- no draft context, absent from the
+PROJECT.md sequence -- `/gsd auto M002` still lands on the idle menu. What changed
+there is the top line, from a false dependency blocker to the #1524
+`/gsd doctor fix` guidance.
+
+**Tests.** Five DB cases in `derive-state-db.test.ts` (locked out-of-scope dep
+resolves; the unscoped derivation is unchanged, which guards against "fixing" the
+first by widening the scope filter itself; a genuinely unmet dep still blocks; a
+met-deps queued shell is not a dependency block; a blocker names only the unmet
+subset). Six in a new `state-projection-scoped-write.test.ts` covering both guarded
+writers, including the absent-file and no-lock counterparts. Four of the eleven go
+red on the pre-patch source, verified by reverting the two source files; the rest
+pass on it, which is what a regression guard should do.
+
+**One test in that new file was vacuous on the first pass, worth naming.** The
+`renderStateProjection` case originally ran with no database open -- so the
+pre-patch code returned early at `!isDbAvailable()` and wrote nothing either, and
+the "STATE.md is byte-identical" assertion passed with or without the fix. Only the
+`{stale: false}` flag was load-bearing. It now opens an in-memory DB with milestone
+and slice rows, which is what makes the write suppression actually measurable. Same
+class as patch 16's `base`-guard trap: an assertion that cannot fail proves
+nothing, and a green suite is not evidence that the mechanism is pinned.
+
+---
+
+## The SDK bump 0.2.83 -> 0.3.229
 
 Not a patch: a fork-local dependency decision, so it is listed separately and is
-not written to be cherry-picked. Commit `d603c456`.
+not written to be cherry-picked. Commit `04752ca8`.
 
 **This closes the open question below** under *Investigated and rejected -- Flat
 elicitation capability*: "something produced the error, re-measure the next time
@@ -678,7 +1204,7 @@ patch 8's diagnostics recorded four times:
  "capabilities":{"roots":{}},"clientInfo":{"name":"claude-code","version":"2.1.83"}}
 ```
 
-**Measured on the wire, not inferred.** The bundled 2.1.227 binary's capability
+**Measured on the wire, not inferred.** The bundled 2.1.229 binary's capability
 factory reads `{roots:{listChanged:!0}, elicitation:{}, ...}` -- unconditional;
 the flag name survives only in the `tengu_mcp_elicitation_shown` /
 `_response` telemetry events. Confirmed against a stub MCP server that records
@@ -688,7 +1214,7 @@ so no model and no tokens):
 | | advertised capabilities | client version |
 | --- | --- | --- |
 | before | `{"roots":{}}` | 2.1.83 |
-| after | `{"roots":{"listChanged":true},"elicitation":{}}` | 2.1.227 |
+| after | `{"roots":{"listChanged":true},"elicitation":{}}` | 2.1.229 |
 
 `elicitation: {}` is the flat shape the MCP SDK's `ElicitationCapabilitySchema`
 preprocess upgrades to `{ form: {} }`, which `elicitation-capability.test.ts`
@@ -696,9 +1222,12 @@ already pins end-to-end over a real transport with real negotiation.
 
 **Peer floors.** `@anthropic-ai/sdk` to `^0.93.0` (the SDK peers `>=0.93.0`) and
 `@modelcontextprotocol/sdk` to `^1.29.0`. Each workspace package declares its own
-range, so `packages/mcp-server` -- the package that actually elicits -- and
-`packages/cloud-mcp-gateway` were raised too; bumping only the root leaves the
-floor unraised where it matters. `packages/pi-ai` and `packages/daemon` keep their
+range, so `packages/mcp-server` -- the package that actually elicits -- is raised
+too; bumping only the root leaves the floor unraised where it matters. (The
+v1.14.0 edition also raised `packages/cloud-mcp-gateway`; upstream **deleted**
+that package, along with `packages/gsd-cloud`, before v1.15.0, so the bump now
+touches only the root and `packages/mcp-server`.) `packages/pi-ai` and
+`packages/daemon` keep their
 own `@anthropic-ai/sdk` pins: neither imports the agent SDK, and nothing under
 the root `src/` imports `@anthropic-ai/sdk` at all.
 
@@ -740,13 +1269,20 @@ and bumping this repo's SDK does not stop 0.2.x-based tools from spawning
 **Typed API risk measured, not assumed.** `buildSdkOptions` returns
 `Record<string, unknown>`, so a renamed or dropped option fails **silently** --
 the unit tests assert on the object gsd-pi *builds*, not on what the SDK
-consumes, and no existing check covers it. Diffing the `query` `Options` type
-across the two releases: **0 keys removed**, 14 added (`toolAliases`,
-`onUserDialog`, `supportedDialogKinds`, `sessionStore`, `sessionStoreFlush`,
-`loadTimeoutMs`, `includeHookEvents`, `forwardSubagentText`, `taskBudget`,
-`planModeInstructions`, `resumeDropsTurn`, `managedSettings`, `skills`, `title`),
-and all 28 keys `buildSdkOptions` sets are still present. Re-run this diff at
-every SDK bump.
+consumes, and no existing check covers it. Diffing the `query` `Options` type:
+**0 keys removed, 0 renamed**, and all **15** keys `buildSdkOptions` sets are
+present in the 64-key type at 0.3.229 -- `model`, `includePartialMessages`,
+`persistSession`, `cwd`, `permissionMode`, `allowDangerouslySkipPermissions`,
+`settingSources`, `systemPrompt`, `disallowedTools`, `allowedTools`,
+`mcpServers`, `strictMcpConfig`, `betas`, `thinking`, `effort`. The type is
+byte-identical between 0.3.227 and 0.3.229. Re-run this diff at every SDK bump.
+
+> **The "28 keys" in earlier editions of this file was never reproducible.** The
+> `return {` literal sets 15 static keys plus the caller-supplied
+> `...sdkExtraOptions` passthrough, whose members are not statically knowable.
+> When re-running, extract from the return literal itself and include the
+> SHORTHAND members (`permissionMode,` `settingSources,` `disallowedTools,`) and
+> the conditional spreads -- a naive `key:` scan finds only 9 of the 15.
 
 **Installing on this host.** `pnpm install` aborts on the `@opengsd/gsd-browser`
 postinstall, so use `--ignore-scripts` and then re-run
@@ -754,6 +1290,121 @@ postinstall, so use `--ignore-scripts` and then re-run
 [FORK.md](FORK.md#the-claude-agent-sdk-bump). `--ignore-scripts` does not affect
 the platform binary: the SDK packages declare no `scripts` and the platform
 packages are pure payload.
+
+## Review pass -- patch 17
+
+Two reviews over patch 17, run in parallel from the same commit -- one **blind**
+(diff and codebase only, forbidden from reading the plan or the bug report) and one
+**informed** (given the plan, the report, and this file, and asked to judge
+fidelity). Seven findings between them, six of which both reached independently.
+All are folded into the patch commit.
+
+| Finding | Reached by | Outcome |
+| --- | --- | --- |
+| A lock-only guard suppresses *creation*, so a caller reports a repair that never happened | both | **fixed** -- exists-conditional guard |
+| `rebuildState` discards the declined-write signal | both | **fixed** -- returns `boolean`, `doctor-proactive` honours it |
+| The doctor guard also suppressed `state_file_missing` **detection** | both | **fixed** -- guard moved onto the staleness branch |
+| The blocker names met deps as unmet | both | **fixed** -- unmet subset only |
+| #1524 message says "no dependencies" on a branch now reachable with deps | blind | **fixed** -- "no unmet dependencies" |
+| The `renderStateProjection` test was vacuous (no DB, so nothing to suppress) | blind | **fixed** -- in-memory DB + rows |
+| "the lock is always set in auto mode" is false -- plain `/gsd auto` sets none | blind | **fixed** -- comment and commit message corrected |
+
+**The most valuable finding is the one that says the obvious guard is wrong.** Both
+reviewers converged on it from opposite directions: skip-if-locked reads as
+self-evidently safe, and it silently degrades "do not overwrite the truth" into "do
+not write at all". The reachable path is concrete -- `.gsd/STATE.md` is gitignored,
+so a fresh worktree has none, and `clearProjectRootStateFiles` deletes the
+project-root copy at teardown; under a lock, nothing else could then create it,
+because this patch had just guarded every other writer. `doctor-proactive` would
+have notified "rebuilt missing STATE.md before dispatch" on every unit of a run in
+which STATE.md never existed. **A guard that makes a state unreachable must be
+checked against the callers whose entire purpose is to reach it.**
+
+**Guarding a check and guarding a repair are different decisions.** The doctor guard
+was first placed on the outer condition, which suppressed the `state_file_missing`
+*diagnostic* along with the write -- so the one surface that would have told the
+operator the projection was gone reported clean. Existence is scope-independent;
+staleness is not. Only the scope-dependent judgement may be skipped.
+
+**Two findings are the patch's own thesis applied one level down.** It exists
+because "has `dependsOn`" was mistaken for "deps are unmet" -- and it then printed
+every dep in the blocker, and told the user a milestone had "no dependencies" when
+it had satisfied ones. Neither was a regression; both were the untouched remainder
+of the same defect, and neither reviewer let the "pre-existing" label settle it.
+
+**The blind/informed split earned its cost.** The informed reviewer verified
+fidelity and confirmed the plan's disagreement with the bug report (tracing
+`parseMilestoneTarget` -> `GSD_MILESTONE_LOCK` -> scope filter -> `depsUnmet` ->
+idle menu), and cleared the guard's blast radius across every STATE.md reader. The
+blind reviewer, with no plan to anchor on, produced the two findings the plan could
+not have contained -- the vacuous test and the false comment -- because it had no
+document telling it what the code was supposed to do.
+
+## Review pass -- patches 15 and 16
+
+Three rounds of review over patches 15 and 16 -- one informed, then one dedicated
+code-reviewer per patch -- raised nine findings. All nine were real and are folded
+into the patch commit they belong to, so each patch stays independently
+cherry-pickable; two were accepted only as corrections to this document. As with
+the earlier pass, the reasoning is recorded because it is what stops the wrong
+version being re-introduced.
+
+| Finding | Patch | Outcome |
+| --- | --- | --- |
+| Bare `refresh` can strand a null DB handle -> `doctor --fix` prunes live records | 16 | **fixed** -- `ensureWorkflowDbForBase` |
+| `status='active'` trusted as liveness -- dead holder, no lease owner | 15 | **fixed** -- `kill(pid, 0)` guard |
+| Inherited worker id bypasses a documented fail-closed return | 15 | **fixed** -- gated on `isAutoActive()` |
+| `hasPlannedMilestoneSliceRows` reads a process-global DB with no base check | 16 | **fixed** -- `base` guard, fail soft |
+| Path guard fails open when `.gsd` is unresolvable | 16 | **fixed** -- `isSameFilesystemPath` |
+| The conjunct restricting an inherited id had no test at all | 15 | **fixed** -- two cases added |
+| Normalization only pinned by a Windows accident; green on Linux CI | 16 | **fixed** -- portable pin added |
+| Retry budget for a constant message is 1, not 3 | 16 | **docs corrected** |
+| Trust boundary wider than claimed: every descendant inherits the env var | 15 | **docs corrected**; code change rejected |
+
+**Three of patch 15's four are the same underlying mistake: trusting the inherited
+id too much.** The env hop makes the id available; it does not make it evidence. The
+holder row must be present, `active`, on this host, *and* its process alive before
+the id means anything, and none of that may substitute for in-process ownership
+when auto is active in this very process.
+
+**Three were invisible to the tests as first written, in three different ways.**
+Both of patch 15's original cases run with `isAutoActive()` false, so neither could
+see a regression on the in-process path. Deleting patch 15's entire restricting
+conjunct left every test green, because the id comparison alone carried them. And
+patch 16's normalization was pinned only by a host accident -- the same assertion
+that catches it here would have passed on Linux CI. Each fix now has a case that
+goes red when that fix alone is disabled, verified one fix at a time rather than as
+a batch.
+
+**The worst finding was not in the patch's own logic but in what it amplified.**
+`refreshWorkflowDatabaseFromDisk` was already a close-then-reopen with a
+process-wide failure mode, and the plan-slice branch already called it; patch 16
+moved that call onto plan-milestone and ahead of every file check, which is what
+put it in `doctor --fix`'s deletion loop. The lesson worth keeping: adding a
+DB-authoritative check to a verification function also enrolls it in every caller
+that *acts* on the result, and one of them deletes state.
+
+**Two review claims were checked and did not hold.** `forensics.ts` was described
+as calling `verifyExpectedArtifact` once per root to *discriminate* project root
+from worktree; it is an `||` over both roots, and `gsdRoot` short-circuits on a
+worktree contract and returns the project `.gsd`, so both resolve to the same DB
+and the OR is unaffected. The related worry that a worktree base would mismatch
+the new path guard fails for the same reason.
+
+**The base-guard fix was nearly worse than the bug it fixed.** The guard is right,
+but the obvious implementation -- a bare `!==` between the two paths -- silently
+disables patch 16 on this host and made three "must reject" tests go green. See the
+measured table in patch 16 above. Accepted only with `isSameFilesystemPath`, plus a
+portable pin, plus the `ensureWorkflowDbForBase` change that keeps a failed reopen
+from stranding a null handle.
+
+**Accepted as prose only.** The fact is correct: `sdkOptions.env`
+reaches every descendant of the dispatch, including Bash-tool subprocesses, not
+just the workflow MCP server, and the original wording in patch 15 used
+"descendants" to argue a narrower boundary than it earns. That section now states
+it plainly. The proposed code change -- compare the canonical milestone root --
+was rejected for the same reason `project_root_realpath` is not compared: it
+re-wedges worktree sessions, which is the defect patch 15 exists to fix.
 
 ## Review pass
 
@@ -861,7 +1512,7 @@ wrong reason:
 missing `form`. The `tengu_mcp_elicitation` client feature flag in claude-code
 2.1.83 defaults to off, so the preprocess had nothing to upgrade -- it only
 rewrites an *empty* elicitation object, and there was no elicitation key. Fixed
-by [the SDK bump](#the-sdk-bump-0283---03227); patch 14 is what makes the failure
+by [the SDK bump](#the-sdk-bump-0283---03229); patch 14 is what makes the failure
 recoverable for any client that still cannot elicit.
 
 So the hypothesis was wrong in a specific, useful way: the shape was not
@@ -894,14 +1545,14 @@ re-checking against the current tree first.
 
 B1, B2, B5 and B6 are now patches 10-13. Re-verifying them against v1.14.0
 changed the diagnosis twice, which is the argument for re-checking rather than
-porting:
+porting. B3, B4 and B7 were each re-confirmed still open at **v1.15.0**:
 
 - **B5** was recorded as "lock failures discard `error.cause`". The cause is in
   fact *created* correctly at the native throw site; two re-wrap sites drop it.
 - **B6** was recorded as "headless drops trailing argv". `parseHeadlessArgs`
   collects the argv fine; the `doctor` branch ignores it.
 
-**Verified still open in v1.14.0, and deliberately deferred:**
+**Verified still open at v1.15.0, and deliberately deferred:**
 
 - **B3 -- `checkbox_db_status_divergence` is hardcoded `fixable: false`**
   (`doctor-engine-checks.ts:92`), so `doctor fix` and `doctor heal` skip it.
@@ -917,11 +1568,38 @@ porting:
   new query tool is a feature, and belongs in an upstream discussion rather than a
   fork patch.
 - **B7 -- a timeout-clipped `rebuild markdown` reverts PLAN files.** Confirmed
-  non-atomic: `rebuildMarkdownProjectionsFromDb` (`commands-maintenance.ts`)
+  non-atomic: `rebuildMarkdownProjectionsFromDb` (`projection-worker.ts:73`;
+  `commands-maintenance.ts` only re-exports it)
   quarantines, then calls `renderAllFromDb`, which walks files sequentially.
   Cross-file atomicity is a design change, and an honest test needs a mid-loop
   kill. The most dangerous item on the list and the least suited to being rushed
-  in behind four others.
+  in behind four others. **Citation corrected at the v1.15.0 rebase** -- earlier
+  editions cited `commands-maintenance.ts`, which now only re-exports it.
+**Investigated and CLOSED -- not a defect:**
+
+- **B8 -- `renderPlanProjection` writes a different, unstamped document.**
+  Raised while re-deriving patch 4, then **closed on evidence**.
+  `workflow-projections.ts:106 renderPlanProjection()` renders through
+  `renderPlanContent` and ends in a bare unstamped `atomicWriteSync`, refreshing
+  neither the DB row nor the marker, while `renderPlanFromDb` renders through
+  `renderSlicePlanMarkdown` and `writeAndStore`. The two outputs are not the same
+  document -- measured at 170 bytes against 366, diverging at line 2 -- and in a
+  legacy-layout project they resolve to the same file.
+
+  **It is unreachable.** `renderPlanProjection` has no production caller, and had
+  none at `v1.14.0` either; the only callers in the tree are tests.
+  `renderAllProjections` is forbidden from calling it by the #3651 regression
+  test (`tests/projection-no-plan-overwrite.test.ts`) precisely because it
+  overwrote the authoritative PLAN.md with a simplified render that dropped
+  Must-Haves / Verification / Files Likely Touched and corrupted multi-line task
+  descriptions. Missing-file recovery calls `renderPlanFromDb`. Upstream's own
+  `docs/dev/M003-S05-OVERENGINEERING-REVIEW.html` reaches the same conclusion and
+  recommends deleting `renderPlanProjection` and `renderPlanContent` outright.
+
+  **Do not patch this in the fork.** The correct disposition is upstream deletion
+  of dead code, not a fork-local rewrite of a function nothing calls. Recorded
+  here only so the next reader does not re-derive the same false lead -- as three
+  successive editions of patch 4's own rationale did.
 
 **Already fixed upstream -- do not port:**
 
@@ -929,12 +1607,18 @@ porting:
   `markdown-renderer.ts` and a live consumer in
   `state-reconciliation/drift/stale-render.ts`.
 - The `task-completion-compatibility-adapter` failure `verified publication
-  atomically closes only its task gates from durable Attempt evidence` fails on
-  this v1.14.0 base but passes on `main`, fixed by upstream `63254779`
-  ("fix(gsd): classify staged task summaries consistently") plus `2e4ca77f` and
-  `3037a37c`. The fork never touched that file. Patch 9 also happens to repair it
-  on this base. Note for the next rebase: **patch 12 touches a file upstream has
-  already moved**, so expect to re-derive rather than re-apply.
+  atomically closes only its task gates from durable Attempt evidence` was
+  recorded against the **v1.14.0** base as failing there while passing on `main`,
+  fixed by upstream `63254779` ("fix(gsd): classify staged task summaries
+  consistently") plus `2e4ca77f` and `3037a37c`. The fork never touched that
+  file. **Resolved by the v1.15.0 rebase**, which carries those commits; that
+  base-versus-`main` distinction no longer exists, since `v1.15.0` and `main` are
+  the same commit.
+
+  The same entry predicted that **patch 12 would need re-deriving because
+  upstream had moved the file**. It did not: `task-completion-compatibility-adapter.ts`
+  is byte-identical across `v1.14.0..v1.15.0` and patch 12 replayed clean. Treat
+  the prediction as open, not as fact.
 
 ## Maintenance
 
