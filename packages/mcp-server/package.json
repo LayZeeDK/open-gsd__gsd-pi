@@ -52,7 +52,7 @@
   "dependencies": {
     "@opengsd/contracts": "workspace:*",
     "@opengsd/rpc-client": "workspace:*",
-    "@modelcontextprotocol/sdk": "^1.27.1",
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "zod": "^4.0.0"
   },
   "devDependencies": {
