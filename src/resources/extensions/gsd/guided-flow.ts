@@ -15,7 +15,7 @@ import {
   requiresInteractiveMenu,
   isInteractiveCommandContext,
 } from "./command-feedback.js";
-import { loadFile, saveFile } from "./files.js";
+import { loadFile } from "./files.js";
 import { isDbAvailable, getMilestone, getMilestoneSlices, insertMilestone } from "./gsd-db.js";
 import { parseRoadmapSlices } from "./roadmap-slices.js";
 import { loadPrompt, inlineTemplate } from "./prompt-loader.js";
@@ -1345,10 +1345,12 @@ export async function showDiscuss(
 
   // Rebuild STATE.md from derived state before any dispatch (#3475).
   // Without this, guided prompts read a stale STATE.md cache and the
-  // agent bootstraps from the wrong milestone.
+  // agent bootstraps from the wrong milestone. saveStateProjection declines the
+  // write when this process is milestone-scoped -- `state` then describes one
+  // milestone, not the project.
   try {
-    const { buildStateMarkdown } = await import("./doctor.js");
-    await saveFile(resolveGsdRootFile(basePath, "STATE"), buildStateMarkdown(state));
+    const { saveStateProjection } = await import("./doctor.js");
+    await saveStateProjection(basePath, state);
   } catch (err) {
     logWarning("guided", `STATE.md rebuild failed: ${(err as Error).message}`);
   }
@@ -2114,9 +2116,10 @@ export async function showSmartEntry(
   const state = await deriveState(basePath);
 
   // Rebuild STATE.md from derived state before any dispatch (#3475).
+  // Declined under GSD_MILESTONE_LOCK -- see saveStateProjection.
   try {
-    const { buildStateMarkdown } = await import("./doctor.js");
-    await saveFile(resolveGsdRootFile(basePath, "STATE"), buildStateMarkdown(state));
+    const { saveStateProjection } = await import("./doctor.js");
+    await saveStateProjection(basePath, state);
   } catch (err) {
     logWarning("guided", `STATE.md rebuild failed: ${(err as Error).message}`);
   }

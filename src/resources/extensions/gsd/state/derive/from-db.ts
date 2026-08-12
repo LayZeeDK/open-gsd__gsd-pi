@@ -277,7 +277,8 @@ async function buildRegistryAndFindActive(
 function handleNoActiveMilestone(
   registry: MilestoneRegistryEntry[],
   requirements: any,
-  milestoneProgress: { done: number, total: number }
+  milestoneProgress: { done: number, total: number },
+  completeMilestoneIds: Set<string>,
 ): GSDState {
   const pendingEntries = registry.filter(e => e.status === 'pending');
   const parkedEntries = registry.filter(e => e.status === 'parked');
@@ -290,9 +291,17 @@ function handleNoActiveMilestone(
   };
 
   if (pendingEntries.length > 0) {
+    // Carrying `dependsOn` is not the same as those deps being unmet: the
+    // queued-shell push above attaches deps on a branch only reachable once
+    // depsUnmet was false. Judge the deps, not their mere presence, or a
+    // met-deps shell reports a phantom dependency block and loses the #1524
+    // orphan-row guidance with its `/gsd doctor fix` recovery path. Name only
+    // the unmet subset too -- an entry blocked on one of three deps must not
+    // send the user chasing the two that are already complete.
     const blockerDetails = pendingEntries
-      .filter(e => e.dependsOn && e.dependsOn.length > 0)
-      .map(e => `${e.id} is waiting on unmet deps: ${e.dependsOn!.join(', ')}`);
+      .map(e => ({ id: e.id, unmet: (e.dependsOn ?? []).filter(dep => !completeMilestoneIds.has(dep)) }))
+      .filter(e => e.unmet.length > 0)
+      .map(e => `${e.id} is waiting on unmet deps: ${e.unmet.join(', ')}`);
 
     // Genuine dependency block: at least one pending milestone is waiting on an
     // unmet dependency, so directing the user at those deps is accurate.
@@ -308,11 +317,14 @@ function handleNoActiveMilestone(
     // old "resolve dependencies" blocker was misleading and offered no recovery
     // path (#1524). Point the user at the doctor (which now flags these as
     // orphan milestone rows) or at planning a real milestone.
+    // "no unmet dependencies", not "no dependencies": now that the filter above
+    // judges deps instead of their presence, a shell whose deps are all complete
+    // reaches here, and saying it has none would be wrong.
     const phantomIds = pendingEntries.map(e => e.id).join(', ');
     return buildDerivedState(
       context,
       'pre-planning',
-      `Found queued milestone(s) with no planning content and no dependencies (${phantomIds}) — likely orphaned rows. Run /gsd doctor fix to repair them, or /gsd to plan a milestone.`,
+      `Found queued milestone(s) with no planning content and no unmet dependencies (${phantomIds}) -- likely orphaned rows. Run /gsd doctor fix to repair them, or /gsd to plan a milestone.`,
     );
   }
 
@@ -467,8 +479,18 @@ export async function deriveStateFromDb(
     );
   }
 
-  const { completeMilestoneIds, parkedMilestoneIds } = buildCompletenessSet(basePath, milestones);
-  
+  // Completeness is a whole-project fact -- a scoped derivation must still see
+  // milestones outside its scope, or dependency edges pointing out of scope read
+  // as unmet. So this reads `allMilestones` while the registry loop below keeps
+  // the scoped `milestones`; the two lists are one line apart, and collapsing
+  // them back into one is the bug: under GSD_MILESTONE_LOCK=M002 a satisfied
+  // `depends_on: ["M001"]` would register M002 as `pending`, nothing would
+  // become active, and phase would fall to `blocked`. `getActiveMilestoneId`
+  // (state.ts) already resolves a locked milestone with no dependency check at
+  // all; this keeps the two answers in agreement.
+  const { completeMilestoneIds, parkedMilestoneIds } = buildCompletenessSet(basePath, allMilestones);
+
+
   const registryContext = await buildRegistryAndFindActive(basePath, milestones, completeMilestoneIds, parkedMilestoneIds);
   const { registry, activeMilestone, activeMilestoneSlices, activeMilestoneHasDraft } = registryContext;
   
@@ -478,7 +500,7 @@ export async function deriveStateFromDb(
   };
 
   if (!activeMilestone) {
-    return handleNoActiveMilestone(registry, requirements, milestoneProgress);
+    return handleNoActiveMilestone(registry, requirements, milestoneProgress, completeMilestoneIds);
   }
 
   if (activeMilestoneSlices.length === 0) {

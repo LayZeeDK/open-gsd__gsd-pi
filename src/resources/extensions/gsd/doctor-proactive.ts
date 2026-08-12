@@ -256,11 +256,16 @@ export async function preDispatchHealthGate(basePath: string): Promise<PreDispat
     const milestonesDir = join(gsdRoot(basePath), "milestones");
     if (existsSync(milestonesDir) && !existsSync(stateFile)) {
       try {
-        await rebuildState(basePath);
-        fixesApplied.push("rebuilt missing STATE.md before dispatch");
+        // Honour the return value: saveStateProjection can decline the write,
+        // and reporting a repair that did not happen is worse than saying so.
+        if (await rebuildState(basePath)) {
+          fixesApplied.push("rebuilt missing STATE.md before dispatch");
+        } else {
+          fixesApplied.push("STATE.md missing -- will rebuild after first unit completes");
+        }
       } catch {
         // Rebuild failed — non-blocking, dispatch continues
-        fixesApplied.push("STATE.md missing — will rebuild after first unit completes");
+        fixesApplied.push("STATE.md missing -- will rebuild after first unit completes");
       }
     }
   } catch {

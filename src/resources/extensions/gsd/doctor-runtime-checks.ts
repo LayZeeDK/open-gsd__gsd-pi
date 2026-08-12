@@ -5,6 +5,7 @@ import type { DoctorIssue, DoctorIssueCode } from "./doctor-types.js";
 import { cleanNumberedGsdVariants } from "./repo-identity.js";
 import { milestonesDir, gsdRoot, resolveGsdRootFile, milestoneDirExists } from "./paths.js";
 import { deriveState, isGhostMilestone, isReusableGhostMilestone } from "./state.js";
+import { getRequestedMilestoneLock } from "./state/derive/db-open.js";
 import { saveFile } from "./files.js";
 import { nativeIsRepo, nativeForEachRef, nativeUpdateRef } from "./native-git-bridge.js";
 import { readCrashLock, isLockProcessAlive, clearStaleWorkerLock } from "./crash-recovery.js";
@@ -418,7 +419,16 @@ export async function checkRuntimeHealth(
           await saveFile(stateFilePath, buildStateMarkdownForCheck(state));
           fixesApplied.push("created STATE.md from derived state");
         }
-      } else {
+      } else if (!getRequestedMilestoneLock()) {
+        // Staleness -- unlike existence -- is not a scope-independent fact. A
+        // milestone-scoped derivation sees one milestone, so the drift it
+        // "detects" here IS the scoping, and the repair below would persist a
+        // truncated registry as project state. runGSDDoctor(fix:true) runs under
+        // the lock on the `/gsd auto <id>` resume path, so skip the comparison
+        // outright rather than report a warning nobody can act on. Creation
+        // above stays unguarded: an absent STATE.md holds nothing to protect.
+        // See saveStateProjection in doctor.ts.
+
         // Check if STATE.md is stale by comparing active milestone/slice/phase
         const currentContent = readFileSync(stateFilePath, "utf-8");
         const state = await deriveState(basePath);

@@ -10,6 +10,7 @@ import {
 import { hasRequiredSchemaFeature } from "./db-required-schema.js";
 import { resolveMilestoneFile, milestonesDir, legacyMilestonesDir, resolveGsdRootFile } from "./paths.js";
 import { deriveState } from "./state.js";
+import { getRequestedMilestoneLock } from "./state/derive/db-open.js";
 import { invalidateAllCaches } from "./cache.js";
 import { loadEffectiveGSDPreferences, type GSDPreferences } from "./preferences.js";
 import { appendDoctorHistory } from "./doctor-history.js";
@@ -154,19 +155,65 @@ export function buildStateMarkdown(state: Awaited<ReturnType<typeof deriveState>
   return lines.join("\n");
 }
 
+/**
+ * Write STATE.md, unless doing so would overwrite the whole-project projection
+ * with a milestone-scoped one.
+ *
+ * STATE.md is the whole-project projection; a GSD_MILESTONE_LOCK derivation
+ * sees one milestone, so writing it truncates the registry and can persist a
+ * scope-local blocker as project state.
+ *
+ * The lock alone is not enough to decline: an ABSENT STATE.md holds nothing
+ * worth protecting, and several callers exist only to create it (doctor's
+ * state_file_missing fix, doctor-proactive's pre-dispatch rebuild). Worktree
+ * teardown deletes the project-root copy, so under a lock this is reachable,
+ * and declining there would leave the file missing for a whole scoped run --
+ * dropping the STATE section from every dispatched prompt -- while the caller
+ * still reported a repair. So skip only when a file already exists.
+ *
+ * ponytail: skips the write rather than re-deriving unscoped, so STATE.md goes
+ * stale for the duration of a scoped run. Stale-but-true beats fresh-but-wrong
+ * (guided prompts bootstrap from this file) and the next unscoped /gsd or
+ * `gsd doctor` rewrites it. Upgrade path if staleness bites: re-derive with the
+ * lock env temporarily cleared, the way auto.ts's capture/restoreMilestoneLockEnv
+ * already does at session boundaries.
+ *
+ * Returns false when the write was skipped because of the lock. Callers that
+ * report a repair MUST honour it; the guided-flow sites may ignore it, they
+ * already swallow failures into logWarning.
+ */
+export async function saveStateProjection(
+  basePath: string,
+  state: Awaited<ReturnType<typeof deriveState>>,
+): Promise<boolean> {
+  const path = resolveGsdRootFile(basePath, "STATE");
+
+  if (getRequestedMilestoneLock() && existsSync(path)) return false;
+
+  await saveFile(path, buildStateMarkdown(state));
+
+  return true;
+}
+
 async function updateStateFile(basePath: string, fixesApplied: string[]): Promise<void> {
   const state = await deriveState(basePath);
   const path = resolveGsdRootFile(basePath, "STATE");
-  await saveFile(path, buildStateMarkdown(state));
-  fixesApplied.push(`updated ${path}`);
+
+  if (await saveStateProjection(basePath, state)) {
+    fixesApplied.push(`updated ${path}`);
+  }
 }
 
-/** Rebuild STATE.md from current disk state. Exported for auto-mode post-hooks. */
-export async function rebuildState(basePath: string): Promise<void> {
+/**
+ * Rebuild STATE.md from current disk state. Exported for auto-mode post-hooks.
+ * Returns false when saveStateProjection declined the write, so callers that
+ * report a repair do not claim one that never happened.
+ */
+export async function rebuildState(basePath: string): Promise<boolean> {
   invalidateAllCaches();
   const state = await deriveState(basePath);
-  const path = resolveGsdRootFile(basePath, "STATE");
-  await saveFile(path, buildStateMarkdown(state));
+
+  return saveStateProjection(basePath, state);
 }
 
 export async function selectDoctorScope(basePath: string, requestedScope?: string): Promise<string | undefined> {

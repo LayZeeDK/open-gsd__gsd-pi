@@ -23,6 +23,7 @@ import { readFile } from "node:fs/promises";
 import { logWarning } from "./workflow-logger.js";
 import { isClosedStatus } from "./status-guards.js";
 import { deriveState } from "./state.js";
+import { getRequestedMilestoneLock } from "./state/derive/db-open.js";
 import type { GSDState } from "./types.js";
 import { renderPlanFromDb, renderRoadmapFromDb, writeTaskSummaryProjection } from "./markdown-renderer.js";
 import { readManifest } from "./workflow-manifest.js";
@@ -405,6 +406,16 @@ export function renderStateContent(state: GSDState): string {
  */
 export async function renderStateProjection(basePath: string): Promise<{ stale: boolean }> {
   try {
+    // STATE.md is the whole-project projection, but deriveState() below honours
+    // GSD_MILESTONE_LOCK -- under a lock it returns one milestone, so writing it
+    // truncates the registry and can persist a scope-local blocker as project
+    // state. complete-task/complete-slice reach here on every unit, so this
+    // fires whenever the session was scoped to a milestone (`/gsd auto <id>`,
+    // `/gsd next <id>`) or the unit runs in a spawned parallel worker; plain
+    // `/gsd auto` sets no lock and still projects normally. Not `stale: true`:
+    // nothing failed and no repair is wanted, the next unscoped derive rewrites
+    // the file. See saveStateProjection in doctor.ts.
+    if (getRequestedMilestoneLock()) return { stale: false };
     if (!isDbAvailable()) return { stale: true };
     // Probe DB handle — adapter may be set but underlying handle closed
     const adapter = _getAdapter();

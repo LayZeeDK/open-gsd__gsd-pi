@@ -1521,4 +1521,184 @@ describe('derive-state-db', async () => {
       cleanup(base);
     }
   });
+
+  // --- Milestone-lock scoping must not orphan out-of-scope dependencies ---
+  // GSD_MILESTONE_LOCK narrows the registry to one milestone (that is its
+  // point), but completeness is a whole-project fact. Judging `depends_on`
+  // against the scoped list makes a satisfied edge that points out of scope
+  // read as unmet, so `/gsd auto M002` derived phase `blocked` with a false
+  // "waiting on unmet deps" blocker and never promoted M002.
+  test('derive-state-db: a milestone lock does not orphan an out-of-scope dependency', async () => {
+    const base = createFixtureBase();
+    const prevLock = process.env.GSD_MILESTONE_LOCK;
+    try {
+      openDatabase(':memory:');
+      insertMilestone({ id: 'M001', title: 'First', status: 'complete' });
+      insertMilestone({ id: 'M002', title: 'Second', status: 'planned', depends_on: ['M001'] });
+      insertSlice({ id: 'S01', milestoneId: 'M002', title: 'First Slice' });
+
+      process.env.GSD_MILESTONE_LOCK = 'M002';
+      invalidateStateCache();
+      const dbState = await deriveStateFromDb(base);
+
+      assert.equal(dbState.activeMilestone?.id, 'M002', 'lock-dep: locked M002 is active');
+      assert.notEqual(dbState.phase, 'blocked', 'lock-dep: satisfied out-of-scope dep does not block');
+      assert.deepStrictEqual(dbState.blockers, [], 'lock-dep: no dependency blocker recorded');
+      assert.deepStrictEqual(
+        dbState.registry.map(e => e.id),
+        ['M002'],
+        'lock-dep: registry stays scoped to the lock',
+      );
+
+      closeDatabase();
+    } finally {
+      if (prevLock === undefined) delete process.env.GSD_MILESTONE_LOCK;
+      else process.env.GSD_MILESTONE_LOCK = prevLock;
+      invalidateStateCache();
+      closeDatabase();
+      cleanup(base);
+    }
+  });
+
+  // Guards against "fixing" the test above by widening the scope filter itself:
+  // an unscoped derivation must still see and report every milestone.
+  test('derive-state-db: an unscoped derivation over the same fixture is unchanged', async () => {
+    const base = createFixtureBase();
+    const prevLock = process.env.GSD_MILESTONE_LOCK;
+    try {
+      delete process.env.GSD_MILESTONE_LOCK;
+
+      openDatabase(':memory:');
+      insertMilestone({ id: 'M001', title: 'First', status: 'complete' });
+      insertMilestone({ id: 'M002', title: 'Second', status: 'planned', depends_on: ['M001'] });
+      insertSlice({ id: 'S01', milestoneId: 'M002', title: 'First Slice' });
+
+      invalidateStateCache();
+      const dbState = await deriveStateFromDb(base);
+
+      assert.equal(dbState.activeMilestone?.id, 'M002', 'unscoped: M002 is active');
+      assert.notEqual(dbState.phase, 'blocked', 'unscoped: not blocked');
+      assert.deepStrictEqual(
+        dbState.registry.map(e => e.id),
+        ['M001', 'M002'],
+        'unscoped: registry lists every milestone',
+      );
+
+      closeDatabase();
+    } finally {
+      if (prevLock === undefined) delete process.env.GSD_MILESTONE_LOCK;
+      else process.env.GSD_MILESTONE_LOCK = prevLock;
+      invalidateStateCache();
+      closeDatabase();
+      cleanup(base);
+    }
+  });
+
+  // The honesty test for the widening above: a dependency that is genuinely
+  // unmet must still block, even though the completeness set now spans
+  // milestones the lock excludes from the registry.
+  test('derive-state-db: a genuinely unmet dependency still blocks under a lock', async () => {
+    const base = createFixtureBase();
+    const prevLock = process.env.GSD_MILESTONE_LOCK;
+    try {
+      openDatabase(':memory:');
+      insertMilestone({ id: 'M001', title: 'First', status: 'queued' });
+      insertMilestone({ id: 'M002', title: 'Second', status: 'planned', depends_on: ['M001'] });
+      insertSlice({ id: 'S01', milestoneId: 'M002', title: 'First Slice' });
+
+      process.env.GSD_MILESTONE_LOCK = 'M002';
+      invalidateStateCache();
+      const dbState = await deriveStateFromDb(base);
+
+      assert.equal(dbState.activeMilestone, null, 'unmet-dep: nothing becomes active');
+      assert.equal(dbState.phase, 'blocked', 'unmet-dep: phase is blocked');
+      assert.deepStrictEqual(
+        dbState.blockers,
+        ['M002 is waiting on unmet deps: M001'],
+        'unmet-dep: the dependency blocker is reported',
+      );
+
+      closeDatabase();
+    } finally {
+      if (prevLock === undefined) delete process.env.GSD_MILESTONE_LOCK;
+      else process.env.GSD_MILESTONE_LOCK = prevLock;
+      invalidateStateCache();
+      closeDatabase();
+      cleanup(base);
+    }
+  });
+
+  // handleNoActiveMilestone used to infer "unmet deps" from an entry merely
+  // *having* dependsOn. The queued-shell push attaches deps on a branch only
+  // reachable once depsUnmet was false, so a met-deps phantom row reported a
+  // dependency block and lost the #1524 `/gsd doctor fix` recovery path.
+  test('derive-state-db: a met-deps queued shell is not reported as a dependency block', async () => {
+    const base = createFixtureBase();
+    const prevLock = process.env.GSD_MILESTONE_LOCK;
+    try {
+      delete process.env.GSD_MILESTONE_LOCK;
+
+      // No PROJECT.md and no CONTEXT/CONTEXT-DRAFT, so M002 is a content-less
+      // queued shell that is not in the roadmap sequence -- non-promotable.
+      openDatabase(':memory:');
+      insertMilestone({ id: 'M001', title: 'First', status: 'complete' });
+      insertMilestone({ id: 'M002', title: 'Second', status: 'queued', depends_on: ['M001'] });
+
+      invalidateStateCache();
+      const dbState = await deriveStateFromDb(base);
+
+      assert.equal(dbState.activeMilestone, null, 'met-deps-shell: shell is not promoted');
+      assert.equal(dbState.phase, 'pre-planning', 'met-deps-shell: phase is pre-planning, not blocked');
+      assert.deepStrictEqual(dbState.blockers, [], 'met-deps-shell: no phantom dependency blocker');
+      assert.ok(
+        dbState.nextAction.includes('/gsd doctor fix'),
+        `met-deps-shell: nextAction offers the orphan-row recovery path, got: ${dbState.nextAction}`,
+      );
+
+      closeDatabase();
+    } finally {
+      if (prevLock === undefined) delete process.env.GSD_MILESTONE_LOCK;
+      else process.env.GSD_MILESTONE_LOCK = prevLock;
+      invalidateStateCache();
+      closeDatabase();
+      cleanup(base);
+    }
+  });
+
+  // The blocker must name only the deps that are actually unmet. Listing every
+  // dep sends the user chasing milestones that are already complete -- the same
+  // "presence is not unmetness" confusion the filter above exists to remove.
+  test('derive-state-db: a dependency blocker names only the unmet deps', async () => {
+    const base = createFixtureBase();
+    const prevLock = process.env.GSD_MILESTONE_LOCK;
+    try {
+      delete process.env.GSD_MILESTONE_LOCK;
+
+      // M002 is a non-promotable queued shell (no PROJECT.md, no context), so it
+      // never completes and never becomes active; M003 therefore has one met dep
+      // (M001) and one unmet dep (M002).
+      openDatabase(':memory:');
+      insertMilestone({ id: 'M001', title: 'First', status: 'complete' });
+      insertMilestone({ id: 'M002', title: 'Second', status: 'queued' });
+      insertMilestone({ id: 'M003', title: 'Third', status: 'planned', depends_on: ['M001', 'M002'] });
+
+      invalidateStateCache();
+      const dbState = await deriveStateFromDb(base);
+
+      assert.equal(dbState.phase, 'blocked', 'unmet-subset: phase is blocked');
+      assert.deepStrictEqual(
+        dbState.blockers,
+        ['M003 is waiting on unmet deps: M002'],
+        'unmet-subset: the complete M001 is not named as unmet',
+      );
+
+      closeDatabase();
+    } finally {
+      if (prevLock === undefined) delete process.env.GSD_MILESTONE_LOCK;
+      else process.env.GSD_MILESTONE_LOCK = prevLock;
+      invalidateStateCache();
+      closeDatabase();
+      cleanup(base);
+    }
+  });
 });
