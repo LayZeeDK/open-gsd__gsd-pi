@@ -80,6 +80,10 @@ function findRecovery(logs: readonly LogEntry[]): LogEntry | undefined {
 test("plan-milestone verify-fail logs a recovery warning naming the zero-slice roadmap", () => {
   const base = createFixtureBase();
   try {
+    // The projection check only reports first when the DB-authority check ahead
+    // of it is unavailable and falls soft. Pin that rather than depending on
+    // this test being declared before the DB-opening cases below.
+    try { closeDatabase(); } catch { /* noop */ }
     const dir = milestoneDir(base, "M001");
     writeFileSync(join(dir, "M001-ROADMAP.md"), "# M001: Stub\n\n## Slices\n\n_TBD_\n", "utf-8");
 
@@ -362,6 +366,9 @@ test("plan-milestone verify logs a recovery warning when the roadmap parser thro
     throw new Error("forced roadmap parse failure");
   });
   try {
+    // As above: the DB-authority check ahead of the parser must fall soft for
+    // the parser failure to be the reported reason.
+    try { closeDatabase(); } catch { /* noop */ }
     const dir = milestoneDir(base, "M001");
     // A real ROADMAP file must exist so verification reaches the parser.
     writeFileSync(join(dir, "M001-ROADMAP.md"), "# M001: x\n\n## Slices\n\n- [ ] **S01: A**\n", "utf-8");

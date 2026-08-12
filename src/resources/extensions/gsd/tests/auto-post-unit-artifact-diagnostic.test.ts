@@ -9,6 +9,7 @@ import {
 } from "../auto-post-unit.ts";
 import { resolveExpectedArtifactPath } from "../auto-recovery.ts";
 import { _clearGsdRootCache, clearPathCache } from "../paths.ts";
+import { openDatabase, closeDatabase, insertMilestone } from "../gsd-db.ts";
 
 test("missing execute-task artifact includes completion contract and completion-tool hint", () => {
   const base = mkdtempSync(join(tmpdir(), "gsd-artifact-diag-"));
@@ -56,6 +57,41 @@ test("parallel research cost spike writes durable PARALLEL-BLOCKER", () => {
   } finally {
     rmSync(base, { recursive: true, force: true });
   }
+});
+
+// The retry context is the only thing the agent sees; the DB reason logged by
+// verification goes to notifications. Pointed at the file it just wrote, the
+// highest-probability repair is to rewrite that file -- re-forging it, up to
+// MAX_ARTIFACT_VERIFICATION_RETRIES times, then pausing. So the message has to
+// name the DB and the tool, not the path.
+test("plan-milestone diagnostic names the DB and gsd_plan_milestone when slice rows are missing", (t) => {
+  const base = mkdtempSync(join(tmpdir(), "gsd-artifact-diag-db-"));
+  t.after(() => {
+    try { closeDatabase(); } catch { /* noop */ }
+    rmSync(base, { recursive: true, force: true });
+  });
+
+  const milestoneDir = join(base, ".gsd", "milestones", "M001");
+  mkdirSync(milestoneDir, { recursive: true });
+  writeFileSync(join(milestoneDir, "M001-ROADMAP.md"), [
+    "# M001: Hand-written",
+    "",
+    "## Slices",
+    "",
+    "- [ ] **S01: First slice** `risk:low` `depends:[]`",
+    "  > After this: a real slice exists.",
+    "",
+  ].join("\n"), "utf-8");
+  _clearGsdRootCache();
+  clearPathCache();
+  openDatabase(join(base, ".gsd", "gsd.db"));
+  insertMilestone({ id: "M001", title: "Hand-written", status: "active" });
+
+  const msg = _describeArtifactVerificationFailureForTest("plan-milestone", "M001", base);
+
+  assert.match(msg, /the workflow DB has no slice rows for M001/);
+  assert.match(msg, /call gsd_plan_milestone to persist the plan/);
+  assert.doesNotMatch(msg, /completion contract/, "must not fall through to the file-shaped message");
 });
 
 // ── #1238: symlinked project root must not produce a ../ path walk ────────────

@@ -68,6 +68,7 @@ import { resolveWorktreeProjectRoot } from "./worktree-root.js";
 import { hasImplementationArtifacts } from "./milestone-implementation-evidence.js";
 import { loadAllCaptures, loadPendingCaptures } from "./captures.js";
 import {
+  BLOCKER_PLACEHOLDER_SLICE_ID,
   readExecuteTaskArtifactReadiness,
   readTerminalTaskRecoveryAbort,
   resolveArtifactVerificationBase,
@@ -518,7 +519,7 @@ export function writeBlockerPlaceholder(
         logWarning("recovery", `Skipping fabricated S00-blocker slice for ${mid}: adopted canonical milestone history exists (fail-closed; see S05 for the real cascade).`);
       } else {
         try {
-          insertSlice({ id: "S00-blocker", milestoneId: mid, title: "Blocker placeholder — planning failed", status: "complete", sequence: 0 });
+          insertSlice({ id: BLOCKER_PLACEHOLDER_SLICE_ID, milestoneId: mid, title: "Blocker placeholder — planning failed", status: "complete", sequence: 0 });
         } catch (e) { logWarning("recovery", `insertSlice placeholder failed for plan-milestone recovery: ${e instanceof Error ? e.message : String(e)}`); }
         try { appendEvent(base, { cmd: "plan-milestone", params: { milestoneId: mid }, ts, actor: "system", trigger_reason: "blocker-placeholder-recovery" }); } catch (e) { logWarning("recovery", `appendEvent failed for plan-milestone recovery: ${e instanceof Error ? e.message : String(e)}`); }
       }

@@ -35,6 +35,7 @@ import {
 import { invalidateAllCaches } from "./cache.js";
 import { rebuildState } from "./doctor.js";
 import { parseUnitId } from "./unit-id.js";
+import { hasPlannedMilestoneSliceRows } from "./artifact-verification.js";
 import { closeoutUnit, type CloseoutOptions } from "./auto-unit-closeout.js";
 import {
   runTurnGitAction,
@@ -1115,6 +1116,16 @@ function describeArtifactVerificationFailure(
       ? " No completion tool call detected (`gsd_task_complete`/alias)."
       : "";
     return `Artifact verification failed: ${relPath} was not found on disk after unit execution${expected ? ` (${expected})` : ""}.${completionToolHint}`;
+  }
+
+  // Without this branch the message below points the agent at the file it just
+  // wrote, and the highest-probability repair is to rewrite that file -- which
+  // is the forgery the DB check exists to reject.
+  if (unitType === "plan-milestone") {
+    const { milestone } = parseUnitId(unitId);
+    if (milestone && !hasPlannedMilestoneSliceRows(milestone, basePath)) {
+      return `Artifact verification failed: ${relPath} exists but the workflow DB has no slice rows for ${milestone}. The DB is the authority and ${relPath} is only its projection -- call gsd_plan_milestone to persist the plan.`;
+    }
   }
 
   const validationKind = artifactValidationKind(unitType);

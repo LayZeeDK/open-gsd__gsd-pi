@@ -103,7 +103,8 @@ import {
   formatPriorContextBrief,
 } from "./preparation.js";
 import { verifyExpectedArtifact } from "./auto-recovery.js";
-import { countPlanMilestoneRoadmapSlices } from "./artifact-verification.js";
+import { countPlanMilestoneRoadmapSlices, hasPlannedMilestoneSliceRows } from "./artifact-verification.js";
+import { parseUnitId } from "./unit-id.js";
 import { createWorkspace, scopeMilestone, type MilestoneScope } from "./workspace.js";
 import { clearPendingGate, extractDepthVerificationMilestoneId, getPendingGate } from "./bootstrap/write-gate.js";
 import {
@@ -196,7 +197,7 @@ export function verifyExpectedArtifactForScope(
   }
   if (unitId === scope.milestoneId && unitType === "plan-milestone") {
     const path = resolveExpectedArtifactPathForScope(scope, unitType, unitId);
-    return verifyScopedPlanMilestoneArtifact(path, unitType, unitId);
+    return verifyScopedPlanMilestoneArtifact(path, unitType, unitId, scope.workspace.projectRoot);
   }
   return verifyExpectedArtifact(unitType, unitId, scope.workspace.projectRoot);
 }
@@ -205,8 +206,19 @@ function verifyScopedPlanMilestoneArtifact(
   path: string | null,
   unitType: string,
   unitId: string,
+  base: string,
 ): boolean {
   if (!path || !existsSync(path)) return false;
+
+  const { milestone } = parseUnitId(unitId);
+  if (!milestone) return false;
+
+  // The DB is the authority (ADR-017); the roadmap below is only its projection.
+  if (!hasPlannedMilestoneSliceRows(milestone, base)) {
+    logWarning("recovery", `verify-fail ${unitType} ${unitId}: no slice rows in the DB (a hand-written or leftover ROADMAP.md is not a plan)`);
+    return false;
+  }
+
   try {
     const roadmapContent = readFileSync(path, "utf-8");
     if (countPlanMilestoneRoadmapSlices(roadmapContent) === 0) {

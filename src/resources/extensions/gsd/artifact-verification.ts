@@ -12,7 +12,13 @@ import {
   getMilestoneSliceSummaries,
   getPendingGatesForTurn,
 } from "./gsd-db.js";
-import { refreshWorkflowDatabaseFromDisk } from "./db-workspace.js";
+import {
+  ensureWorkflowDbForBase,
+  expectedWorkflowDbPathForBase,
+  getWorkflowDatabasePath,
+  refreshWorkflowDatabaseFromDisk,
+} from "./db-workspace.js";
+import { isSameFilesystemPath } from "./external-state-store.js";
 import { isValidationTerminal } from "./state.js";
 import { getErrorMessage } from "./error-utils.js";
 import { logWarning, logError } from "./workflow-logger.js";
@@ -121,6 +127,85 @@ function parseRoadmapForRecovery(content: string): ReturnType<NonNullable<typeof
 /** Slice count for plan-milestone verification; shared by scoped and legacy paths. */
 export function countPlanMilestoneRoadmapSlices(content: string): number {
   return parseRoadmapForRecovery(content).slices.length;
+}
+
+/** Fabricated by writeBlockerPlaceholder (auto-recovery.ts) — never evidence of a plan. */
+export const BLOCKER_PLACEHOLDER_SLICE_ID = "S00-blocker";
+
+/**
+ * Slice rows are the authority for "this milestone was planned" (ADR-017);
+ * ROADMAP.md is only its projection. Without this, any file that parses as a
+ * roadmap counts as proof of planning — a hand-written one, a stale one, a
+ * leftover from a failed render.
+ *
+ * Refresh-on-negative: the orchestrator's long-lived handle can be stale with
+ * respect to rows the workflow MCP server just committed — db/engine.ts
+ * documents exactly that, and the plan-slice branch below guards its own
+ * cross-process read the same way. Only a zero-row read can produce a false
+ * negative, so reconnect only to confirm one rather than on every call.
+ *
+ * The refresh goes through `ensureWorkflowDbForBase`, NOT the bare
+ * `refreshWorkflowDatabaseFromDisk`, because that refresh is a close-then-reopen
+ * and a failed reopen leaves the process-global handle `null` for the rest of the
+ * process. Failing soft on that would hide a dead handle from every later caller
+ * — and `doctor --fix` DELETES any completed-unit key whose artifact does not
+ * verify, so the sibling branches that fail closed on `!isDbAvailable()` would
+ * then prune records for units that are genuinely complete. `ensureWorkflowDbForBase`
+ * reopens by path when the refresh fails, so the handle is repaired rather than
+ * abandoned.
+ *
+ * Fail-soft on every failure (matching plan-slice, which falls back to parsing
+ * the file when the refresh fails): a wedged `/gsd next` is the worse outcome,
+ * and the caller's projection check still runs either way.
+ *
+ * `base` exists only to fail soft when the open handle belongs to a *different*
+ * project. The sibling DB branches in `verifyExpectedArtifact` all read the
+ * global handle keyed on milestone id alone, and two of them fail closed, so a
+ * cross-project read there is worse -- but this branch is new and the guard is
+ * free, and without it a wrong-DB zero-row read would be a hard block rather
+ * than the documented fail-soft. It does not affect the worktree/project-root
+ * pair: `gsdRoot` short-circuits on a worktree contract and returns the project
+ * `.gsd`, so `expectedWorkflowDbPathForBase` agrees for both.
+ */
+export function hasPlannedMilestoneSliceRows(milestoneId: string, base: string): boolean {
+  if (!isDbAvailable()) return true;
+
+  const openDbPath = getWorkflowDatabasePath();
+  if (openDbPath !== null && openDbPath !== ":memory:") {
+    try {
+      // `isSameFilesystemPath`, not `===`: `expectedWorkflowDbPathForBase`
+      // resolves through `gsdRoot` (realpath) while `getWorkflowDatabasePath`
+      // returns the raw path it was opened with, so a bare compare pits an
+      // expanded path against an 8.3 short one (`LARSGY~1`) and reports a
+      // mismatch for the *same* file -- which falls soft and silently disables
+      // this whole check. That is patch 9's bug class. This helper realpaths,
+      // unifies separators and case-folds on win32, and its own doc comment is
+      // about exactly this trap; it also keeps the two sides comparable on the
+      // `resolve()` fallback path when the target no longer exists.
+      if (!isSameFilesystemPath(openDbPath, expectedWorkflowDbPathForBase(base))) {
+        return true;
+      }
+    } catch (err) {
+      logWarning("recovery", `plan-milestone slice-row verification could not resolve the DB path for ${base}: ${getErrorMessage(err)}`);
+
+      return true;
+    }
+  }
+
+  const hasRealRow = () => getMilestoneSliceSummaries(milestoneId)
+    .some((slice) => slice.id !== BLOCKER_PLACEHOLDER_SLICE_ID);
+
+  try {
+    if (hasRealRow()) return true;
+
+    if (!ensureWorkflowDbForBase(base, { refresh: true })) return true;
+
+    return hasRealRow();
+  } catch (err) {
+    logWarning("recovery", `plan-milestone slice-row verification failed for ${milestoneId}: ${getErrorMessage(err)}`);
+
+    return true;
+  }
 }
 
 export function diagnoseWorktreeIntegrityFailure(basePath: string): string | null {
@@ -394,6 +479,16 @@ export function verifyExpectedArtifact(
       return readMilestoneValidationVerdict(milestone) !== undefined;
     } catch (err) {
       logWarning("recovery", `validate-milestone DB verification failed for ${unitId}: ${getErrorMessage(err)}`);
+      return false;
+    }
+  }
+
+  if (unitType === "plan-milestone") {
+    const { milestone } = parseUnitId(unitId);
+    if (!milestone) return false;
+
+    if (!hasPlannedMilestoneSliceRows(milestone, base)) {
+      logWarning("recovery", `verify-fail ${unitType} ${unitId}: no slice rows in the DB (a hand-written or leftover ROADMAP.md is not a plan)`);
       return false;
     }
   }
