@@ -25,6 +25,21 @@ export type {
 
 export const autoSession = new AutoSession();
 
+/**
+ * Per-dispatch channel carrying the auto orchestrator's worker id to the child
+ * `claude` process and the workflow MCP server it launches, so a nested tool
+ * call can recognize its own orchestrator's milestone lease across the process
+ * split. Injected in-memory per dispatch (see injectWorkflowChildEnvTokens in
+ * claude-code-cli/stream-adapter.ts), which deletes any inherited value when no
+ * worker is active -- so a dispatch never passes on a stale id.
+ *
+ * It is NOT confined to the workflow MCP server: it goes into the child's whole
+ * environment, so every descendant of the dispatch inherits it, Bash-tool
+ * subprocesses included. Consumers must treat it as an assertion of identity to
+ * be checked against a live holder row, never as a capability.
+ */
+export const AUTO_WORKER_ID_ENV = "GSD_AUTO_WORKER_ID";
+
 export type AutoRuntimeSnapshot = {
   active: boolean;
   paused: boolean;

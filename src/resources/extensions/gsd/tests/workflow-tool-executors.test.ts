@@ -20,7 +20,7 @@ import {
 import { getAutoWorker, registerAutoWorker } from "../db/auto-workers.ts";
 import { claimMilestoneLease, getMilestoneLease } from "../db/milestone-leases.ts";
 import { deriveState, invalidateStateCache } from "../state.ts";
-import { autoSession } from "../auto-runtime-state.ts";
+import { AUTO_WORKER_ID_ENV, autoSession } from "../auto-runtime-state.ts";
 import { normalizeRealPath, relSliceFile, targetMilestoneFile } from "../paths.ts";
 import { _setManagedProjectionWriteFaultForTest } from "../managed-projection-history.ts";
 import { recordUnitHarnessAbort } from "../unit-runtime.ts";
@@ -1138,6 +1138,167 @@ test("executePlanMilestone refuses a same-milestone lease conflict", async () =>
     assert.equal(result.details.error, "milestone_lease_conflict");
     assert.match(result.content[0].text, /Milestone M001 is currently leased/);
   } finally {
+    closeDatabase();
+    cleanup(base);
+  }
+});
+
+// The auto orchestrator spawns a child `claude`, which spawns the workflow MCP
+// server, so the holder's pid can never be this process. GSD_AUTO_WORKER_ID is
+// the per-dispatch channel that lets the descendant recognize its own
+// orchestrator's lease. Registered against `base` (not a foreign project root)
+// on purpose -- reusing the conflict fixture's `other-project` holder would
+// assert a cross-project lease bypass.
+test("executePlanMilestone plans through its own orchestrator's lease via GSD_AUTO_WORKER_ID", async () => {
+  const base = makeTmpBase();
+  const previousEnv = process.env[AUTO_WORKER_ID_ENV];
+  try {
+    openTestDb(base);
+    seedMilestone("M001", "Existing holder");
+    const holder = registerAutoWorker({ projectRootRealpath: base });
+    const lease = claimMilestoneLease(holder, "M001");
+    assert.equal(lease.ok, true);
+    process.env[AUTO_WORKER_ID_ENV] = holder;
+
+    const result = await inProjectDir(base, () => executePlanMilestone(validMilestonePlan("M001"), base));
+
+    assert.equal(result.isError, undefined);
+    assert.equal(result.details.operation, "plan_milestone");
+    assert.equal(result.details.milestoneId, "M001");
+
+    const after = getMilestoneLease("M001");
+    assert.equal(after?.status, "held", "the reentrant peer must not release the orchestrator's lease");
+    assert.equal(after?.worker_id, holder, "the reentrant peer must not steal the lease");
+    assert.equal(after?.fencing_token, lease.token, "skipping the claim must not bump the fencing token");
+  } finally {
+    if (previousEnv === undefined) {
+      delete process.env[AUTO_WORKER_ID_ENV];
+    } else {
+      process.env[AUTO_WORKER_ID_ENV] = previousEnv;
+    }
+    closeDatabase();
+    cleanup(base);
+  }
+});
+
+// The inherited id must not become a way around the "active auto without a
+// worker row cannot reclaim here" fail-closed return. Reachable when a nested
+// `gsd` is spawned from inside a dispatch (so it inherits the id) and its own
+// worker row was detached by the setup-race pause.
+test("executePlanMilestone ignores GSD_AUTO_WORKER_ID while in-process auto is active without a worker row", async () => {
+  const base = makeTmpBase();
+  const previousEnv = process.env[AUTO_WORKER_ID_ENV];
+  autoSession.reset();
+  try {
+    openTestDb(base);
+    seedMilestone("M061", "Detached-worker milestone");
+    const holder = registerAutoWorker({ projectRootRealpath: normalizeRealPath(base) });
+    const lease = claimMilestoneLease(holder, "M061");
+    assert.equal(lease.ok, true);
+    const heldToken = lease.ok ? lease.token : -1;
+
+    // Auto active, but the worker row was detached -- exactly the state the
+    // fail-closed return exists for. The inherited id names the real holder.
+    process.env[AUTO_WORKER_ID_ENV] = holder;
+    autoSession.active = true;
+    autoSession.workerId = null;
+
+    const result = await inProjectDir(base, () => executePlanMilestone(validMilestonePlan("M061"), base));
+
+    assert.equal(result.isError, true);
+    assert.equal(result.details.error, "milestone_lease_conflict",
+      "an inherited id must not substitute for in-process lease ownership");
+    const surviving = getMilestoneLease("M061");
+    assert.equal(surviving?.status, "held");
+    assert.equal(surviving?.fencing_token, heldToken);
+  } finally {
+    autoSession.reset();
+    if (previousEnv === undefined) {
+      delete process.env[AUTO_WORKER_ID_ENV];
+    } else {
+      process.env[AUTO_WORKER_ID_ENV] = previousEnv;
+    }
+    closeDatabase();
+    cleanup(base);
+  }
+});
+
+// The conjunct restricting an inherited id is the whole trust model, so it needs
+// its own cases: without them the id compare alone would pass every test.
+for (const scenario of [
+  {
+    label: "the holder row is not active",
+    detail: "a stopping holder must not be treated as our live orchestrator",
+    corrupt: (holder: string) => {
+      _getAdapter()!.prepare(`UPDATE workers SET status = 'stopping' WHERE worker_id = :w`).run({ ":w": holder });
+    },
+  },
+  {
+    label: "the holder process is gone",
+    detail: "status='active' is not liveness -- a SIGKILLed orchestrator leaves the row active",
+    corrupt: (holder: string) => {
+      // A PID that cannot be running. Kept far from any real pid so the check
+      // cannot be satisfied by PID reuse on this host.
+      _getAdapter()!.prepare(`UPDATE workers SET pid = 2147483646 WHERE worker_id = :w`).run({ ":w": holder });
+    },
+  },
+]) {
+  test(`executePlanMilestone refuses an inherited GSD_AUTO_WORKER_ID when ${scenario.label}`, async () => {
+    const base = makeTmpBase();
+    const previousEnv = process.env[AUTO_WORKER_ID_ENV];
+    try {
+      openTestDb(base);
+      seedMilestone("M001", "Held by a worker we cannot trust");
+      const holder = registerAutoWorker({ projectRootRealpath: base });
+      const lease = claimMilestoneLease(holder, "M001");
+      assert.equal(lease.ok, true);
+      const heldToken = lease.ok ? lease.token : -1;
+
+      scenario.corrupt(holder);
+      process.env[AUTO_WORKER_ID_ENV] = holder;
+
+      const result = await inProjectDir(base, () => executePlanMilestone(validMilestonePlan("M001"), base));
+
+      assert.equal(result.isError, true, scenario.detail);
+      assert.equal(result.details.error, "milestone_lease_conflict", scenario.detail);
+      const surviving = getMilestoneLease("M001");
+      assert.equal(surviving?.worker_id, holder, "the rejected call must not steal the lease");
+      assert.equal(surviving?.fencing_token, heldToken);
+    } finally {
+      if (previousEnv === undefined) {
+        delete process.env[AUTO_WORKER_ID_ENV];
+      } else {
+        process.env[AUTO_WORKER_ID_ENV] = previousEnv;
+      }
+      closeDatabase();
+      cleanup(base);
+    }
+  });
+}
+
+test("executePlanMilestone still refuses when GSD_AUTO_WORKER_ID names an unrelated worker", async () => {
+  const base = makeTmpBase();
+  const previousEnv = process.env[AUTO_WORKER_ID_ENV];
+  try {
+    openTestDb(base);
+    seedMilestone("M001", "Existing holder");
+    // Foreign project root, as in the env-unset conflict fixture above: it is
+    // what makes the holder non-reclaimable, so the assertion is about the
+    // inherited id being rejected rather than about takeover mechanics.
+    const holder = registerAutoWorker({ projectRootRealpath: join(base, "other-project") });
+    assert.equal(claimMilestoneLease(holder, "M001").ok, true);
+    process.env[AUTO_WORKER_ID_ENV] = `${holder}-not-mine`;
+
+    const result = await inProjectDir(base, () => executePlanMilestone(validMilestonePlan("M001"), base));
+
+    assert.equal(result.isError, true);
+    assert.equal(result.details.error, "milestone_lease_conflict");
+  } finally {
+    if (previousEnv === undefined) {
+      delete process.env[AUTO_WORKER_ID_ENV];
+    } else {
+      process.env[AUTO_WORKER_ID_ENV] = previousEnv;
+    }
     closeDatabase();
     cleanup(base);
   }

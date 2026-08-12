@@ -51,7 +51,7 @@ import { CLAUDE_CODE_MODELS } from "../models.ts";
 import type { AssistantMessage, Context, Message } from "@gsd/pi-ai";
 import type { SDKUserMessage } from "../sdk-types.ts";
 import { _setAutoActiveForTest } from "../../gsd/auto.ts";
-import { autoSession } from "../../gsd/auto-runtime-state.ts";
+import { AUTO_WORKER_ID_ENV, autoSession } from "../../gsd/auto-runtime-state.ts";
 import { getInFlightToolCount, hasInteractiveToolInFlight, clearInFlightTools, isInteractiveElicitationInFlight } from "../../gsd/auto-tool-tracking.ts";
 import { clearMcpConfigCache } from "../../mcp-client/manager.ts";
 import { UNIT_TOOL_CONTRACTS } from "../../gsd/unit-tool-contracts.ts";
@@ -2537,6 +2537,108 @@ describe("stream-adapter — workflow MCP readiness", () => {
 		} finally {
 			autoSession.currentUnit = null;
 			_setAutoActiveForTest(false);
+			restore();
+			rmSync(cwd, { recursive: true, force: true });
+			clearMcpConfigCache();
+		}
+	});
+
+	// The env hop is what lets a nested gsd_plan_milestone recognize its own
+	// orchestrator's milestone lease across the process split. Both channels
+	// matter: the child `claude` inherits `options.env` (and passes it to a
+	// server it launches itself from .mcp.json), while the SDK-injected server
+	// reads `mcpServers[<name>].env`.
+	test("dispatch injects GSD_AUTO_WORKER_ID into both child env channels and clears a stale inherited value", async () => {
+		const cwd = realpathSync(mkdtempSync(join(tmpdir(), "claude-sdk-auto-worker-env-")));
+		const restore = setWorkflowMcpEnv({
+			GSD_WORKFLOW_MCP_COMMAND: process.execPath,
+			GSD_WORKFLOW_MCP_NAME: "gsd-workflow",
+			GSD_WORKFLOW_MCP_ARGS: JSON.stringify(["-e", ""]),
+			GSD_WORKFLOW_MCP_CWD: cwd,
+		});
+		const previousInherited = process.env[AUTO_WORKER_ID_ENV];
+		const previousWorkerId = autoSession.workerId;
+
+		const dispatch = async (): Promise<Record<string, unknown>> => {
+			let capturedOptions: Record<string, unknown> = {};
+			const stream = streamViaClaudeCode(
+				{ id: "claude-sonnet-4-6" } as any,
+				{
+					systemPrompt: "UNIT: Plan Milestone",
+					messages: [{ role: "user", content: "Plan the milestone." } as Message],
+				},
+				{
+					cwd,
+					_skipWorkflowMcpPreflightForTest: true,
+					async *_sdkQueryForTest(args: { options?: Record<string, unknown> }) {
+						capturedOptions = args.options ?? {};
+						yield {
+							type: "result",
+							subtype: "success",
+							uuid: "result-auto-worker-env",
+							session_id: "session-auto-worker-env",
+							duration_ms: 1,
+							duration_api_ms: 1,
+							is_error: false,
+							num_turns: 1,
+							result: "completed",
+							stop_reason: "end_turn",
+							total_cost_usd: 0,
+							usage: {
+								input_tokens: 0,
+								output_tokens: 0,
+								cache_read_input_tokens: 0,
+								cache_creation_input_tokens: 0,
+							},
+						};
+					},
+				} as any,
+			);
+			await stream.result();
+
+			return capturedOptions;
+		};
+
+		clearGuidedUnitContext();
+		try {
+			// A stale value inherited from an unrelated process must not survive.
+			process.env[AUTO_WORKER_ID_ENV] = "auto-stale-from-parent";
+
+			_setAutoActiveForTest(true);
+			autoSession.currentUnit = { type: "plan-milestone", id: "M001", startedAt: 0, workspaceRoot: cwd } as never;
+			autoSession.workerId = "auto-test-host-4242-abcdef01";
+
+			const active = await dispatch();
+			const activeEnv = active.env as Record<string, string | undefined>;
+			const activeServers = active.mcpServers as Record<string, { env?: Record<string, string> }>;
+			assert.equal(activeEnv[AUTO_WORKER_ID_ENV], "auto-test-host-4242-abcdef01");
+			assert.equal(activeServers["gsd-workflow"]?.env?.[AUTO_WORKER_ID_ENV], "auto-test-host-4242-abcdef01");
+
+			// Same dispatch shape, only the worker id differs, so the assertion is
+			// about the delete-then-set-if-present treatment and not about a
+			// differently configured turn.
+			autoSession.workerId = null;
+
+			const idle = await dispatch();
+			const idleEnv = idle.env as Record<string, string | undefined>;
+			const idleServers = idle.mcpServers as Record<string, { env?: Record<string, string> }>;
+			assert.equal(
+				AUTO_WORKER_ID_ENV in idleEnv,
+				false,
+				"a stale inherited worker id must be deleted when no worker is active",
+			);
+			assert.equal(idleServers["gsd-workflow"]?.env?.[AUTO_WORKER_ID_ENV], undefined);
+		} finally {
+			autoSession.currentUnit = null;
+			autoSession.workerId = previousWorkerId;
+			_setAutoActiveForTest(false);
+
+			if (previousInherited === undefined) {
+				delete process.env[AUTO_WORKER_ID_ENV];
+			} else {
+				process.env[AUTO_WORKER_ID_ENV] = previousInherited;
+			}
+
 			restore();
 			rmSync(cwd, { recursive: true, force: true });
 			clearMcpConfigCache();

@@ -88,7 +88,7 @@ import { invalidateStateCache } from "../state.js";
 import { flushWorkflowProjections } from "../projection-flush.js";
 import { loadEffectiveGSDPreferences } from "../preferences.js";
 import { parseProject } from "../schemas/parsers.js";
-import { autoSession, getAutoRuntimeSnapshot, isAutoActive } from "../auto-runtime-state.js";
+import { AUTO_WORKER_ID_ENV, autoSession, getAutoRuntimeSnapshot, isAutoActive } from "../auto-runtime-state.js";
 import { renderPlanFromDb, writeTaskSummaryProjection } from "../markdown-renderer.js";
 import { readUnitHarnessAbort, type UnitHarnessAbortRecord } from "../unit-runtime.js";
 import {
@@ -1883,6 +1883,12 @@ export async function executePlanMilestone(
   let workerId: string | null = null;
   let acquiredToken: number | null = null;
   let leaseRefreshTimer: ReturnType<typeof setInterval> | undefined;
+  // Injected per dispatch by the orchestrator (stream-adapter). The auto
+  // orchestrator spawns a child `claude`, which spawns this MCP server, so
+  // in-process checks (isAutoActive, holder.pid === process.pid) can never
+  // recognize our own orchestrator's lease -- this env hop is what does.
+  const inheritedAutoWorkerId = process.env[AUTO_WORKER_ID_ENV]?.trim() || null;
+  let reentrantAutoLease = false;
   try {
     // Re-read at the gate so a peer-created milestone is not treated as fresh.
     const milestoneExists = getMilestone(params.milestoneId) !== null;
@@ -1895,7 +1901,49 @@ export async function executePlanMilestone(
         const projectRoot = normalizeRealPath(basePath);
         const activeAutoWorkerId = isAutoActive() ? autoSession.workerId : null;
         const activeAutoWorker = activeAutoWorkerId ? getAutoWorker(activeAutoWorkerId) : null;
-        const isOurAutoLease = !!activeAutoWorkerId && heldLease.worker_id === activeAutoWorkerId;
+        // The inherited id is trusted ONLY when auto is not active in this
+        // process. Falling back to it while auto IS active would skip the
+        // "active auto without a worker row cannot reclaim here" fail-closed
+        // return below -- a nested dispatch would then plan against a lease it
+        // does not own. In the workflow MCP server, which is the whole point of
+        // the env hop, isAutoActive() is always false.
+        const ourAutoWorkerId = activeAutoWorkerId ?? (isAutoActive() ? null : inheritedAutoWorkerId);
+        // `status = 'active'` is not liveness: only stopAuto and the janitors
+        // ever clear it, so a SIGKILLed orchestrator leaves an "active" row and
+        // a held lease for up to the TTL. Trusting that would let a descendant
+        // plan with no live lease owner -- and the workflow MCP server is a
+        // grandchild, which Windows does not reliably reap. Same mechanism as
+        // isDeadLocalLeaseHolder (auto/loop.ts), minus its project-root compare;
+        // EPERM means alive-but-not-signallable. Only meaningful because the
+        // caller already required holder.host === hostname(). PID reuse can
+        // still read as alive, exactly as in that helper.
+        const holderProcessAlive = (): boolean => {
+          if (!holder || !Number.isInteger(holder.pid) || holder.pid <= 0) return false;
+
+          if (holder.pid === process.pid) return true;
+
+          try {
+            process.kill(holder.pid, 0);
+
+            return true;
+          } catch (err) {
+            return (err as NodeJS.ErrnoException).code === "EPERM";
+          }
+        };
+        // An inherited id is only trusted against a live local holder row; the
+        // in-process case keeps today's semantics. project_root_realpath is
+        // deliberately not compared -- the orchestrator registers with its
+        // workspace root while this server's root comes from
+        // GSD_WORKFLOW_PROJECT_ROOT, and requiring equality re-wedges worktrees.
+        const isOurAutoLease = !!ourAutoWorkerId
+          && heldLease.worker_id === ourAutoWorkerId
+          && (activeAutoWorkerId !== null
+            || (holder?.status === "active" && holder.host === hostname() && holderProcessAlive()));
+
+        if (isOurAutoLease) {
+          reentrantAutoLease = true;
+        }
+
         const holderIsReentrantPeer = !!holder
           && holder.host === hostname()
           && holder.pid === process.pid
@@ -1927,7 +1975,9 @@ export async function executePlanMilestone(
 
     // Fresh creation cannot claim a lease because the FK row does not exist.
     // In-process auto already owns its lease; re-claiming would bump its token.
-    if (!isAutoActive() && milestoneExists) {
+    // A reentrant peer of our own orchestrator likewise skips the claim, so the
+    // orchestrator keeps owning and refreshing the lease it already holds.
+    if (!isAutoActive() && !reentrantAutoLease && milestoneExists) {
       workerId = registerAutoWorker({ projectRootRealpath: normalizeRealPath(basePath) });
       const lease = claimMilestoneLease(workerId, params.milestoneId);
       if (!lease.ok) {

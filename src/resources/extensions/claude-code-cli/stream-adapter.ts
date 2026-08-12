@@ -74,7 +74,7 @@ import {
 	endWorkflowMcpSdkSession,
 } from "../gsd/workflow-mcp-readiness-cache.js";
 import { getGuidedUnitContext } from "../gsd/guided-unit-context.js";
-import { autoSession, getActiveAutoUnitType, isAutoActive } from "../gsd/auto-runtime-state.js";
+import { AUTO_WORKER_ID_ENV, autoSession, getActiveAutoUnitType, isAutoActive } from "../gsd/auto-runtime-state.js";
 import {
 	beginMilestoneStatusObservationTurn,
 	classifyMilestoneStatusRuntimeMode,
@@ -2366,22 +2366,48 @@ function beginClaudeCodeMilestoneStatusObservation(
 	});
 }
 
-function injectMilestoneStatusObservationToken(
+/**
+ * Injects the per-turn identity tokens the workflow MCP server needs into both
+ * channels that can reach it: `sdkOptions.env`, inherited by the child `claude`
+ * (and thus by a server the CLI launches itself from the project's `.mcp.json`),
+ * and `sdkOptions.mcpServers[<workflow>].env` for the SDK-injected server.
+ *
+ * Every token is deleted before being re-set, so an inherited stale value never
+ * survives a dispatch that has no current value for it.
+ */
+function injectWorkflowChildEnvTokens(
 	sdkOptions: Record<string, unknown>,
 	workflowServerName: string | undefined,
 	token: string | null,
+	autoWorkerId: string | null,
 ): void {
+	const entries: Array<readonly [string, string | null]> = [
+		[MILESTONE_STATUS_OBSERVATION_TOKEN_ENV, token],
+		[AUTO_WORKER_ID_ENV, autoWorkerId],
+	];
+	const apply = (target: Record<string, string | undefined>): void => {
+		for (const [key, value] of entries) {
+			delete target[key];
+
+			if (value) {
+				target[key] = value;
+			}
+		}
+	};
+
 	const childEnv = { ...process.env };
-	delete childEnv[MILESTONE_STATUS_OBSERVATION_TOKEN_ENV];
-	if (token) childEnv[MILESTONE_STATUS_OBSERVATION_TOKEN_ENV] = token;
+	apply(childEnv);
 	sdkOptions.env = childEnv;
 
 	if (!workflowServerName || !isRecord(sdkOptions.mcpServers)) return;
 	const workflowServer = sdkOptions.mcpServers[workflowServerName];
 	if (!isRecord(workflowServer) || typeof workflowServer.command !== "string") return;
-	const serverEnv = { ...(isStringRecord(workflowServer.env) ? workflowServer.env : {}) };
-	delete serverEnv[MILESTONE_STATUS_OBSERVATION_TOKEN_ENV];
-	if (token) serverEnv[MILESTONE_STATUS_OBSERVATION_TOKEN_ENV] = token;
+	// Stays narrow: the SDK declares McpStdioServerConfig.env as
+	// Record<string, string>, and `apply` only ever assigns a truthy string.
+	const serverEnv: Record<string, string> = {
+		...(isStringRecord(workflowServer.env) ? workflowServer.env : {}),
+	};
+	apply(serverEnv);
 	sdkOptions.mcpServers = {
 		...sdkOptions.mcpServers,
 		[workflowServerName]: {
@@ -2470,10 +2496,11 @@ async function pumpSdkMessages(
 				projectRoot,
 			);
 		}
-		injectMilestoneStatusObservationToken(
+		injectWorkflowChildEnvTokens(
 			sdkOpts,
 			workflowMcpServerName,
 			milestoneStatusObservationToken,
+			isAutoActive() ? autoSession.workerId : null,
 		);
 		const allowPendingToolSearchHydration =
 			Boolean(workflowMcpServerName && gsdPhase)
