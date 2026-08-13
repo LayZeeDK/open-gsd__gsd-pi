@@ -140,28 +140,38 @@ export function setupEditorSubmitHandler(host: InteractiveModeStateHost & {
 
 		host.flushPendingBashComponents();
 
-		if (host.options?.submitPromptsDirectly) {
-			host.editor.addToHistory?.(text);
-			try {
-				markEditorSubmitLatency(host, images);
-				await host.session.prompt(text, { images });
-			} catch (error: unknown) {
-				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
-				host.showError(errorMessage);
-			}
-			return;
-		}
-
+		// Both settings of submitPromptsDirectly dispatched identically, so this is
+		// the single idle-submit site. It still goes through session.prompt so user
+		// input is not silently discarded.
+		//
+		// streamingBehavior is inert unless the session is streaming, so it changes
+		// nothing on this path except in one case: the isStreaming check above is a
+		// check-then-act, and prompt() re-reads the flag after awaiting its
+		// extension-command and input-handler hooks. If the agent enters streaming
+		// inside that window the submit is queued instead of throwing.
+		//
+		// followUp, not steer, for that contingency. This submit observed an IDLE
+		// session, so the run it would steer is one the user never saw. Ordering
+		// after it is the conservative reading, it matches Alt+Enter (which routes
+		// its idle case through here, see interactive-key-handlers.ts), and unlike
+		// steer it cannot strand: agent-loop.ts polls the follow-up queue when the
+		// agent would otherwise stop. A submit that DID observe streaming still
+		// steers, in the branch above.
 		host.editor.addToHistory?.(text);
-		// submitPromptsDirectly is false; still dispatch via session.prompt so user input
-		// is not silently discarded.
+		// Normally a no-op, since Editor.submitValue() clears before calling this.
+		// Alt+Enter's idle case reaches us via CustomEditor.onAction, which does not.
+		host.editor.setText("");
 		try {
 			markEditorSubmitLatency(host, images);
-			await host.session.prompt(text, { images });
+			await host.session.prompt(text, { streamingBehavior: "followUp", images });
 		} catch (error: unknown) {
 			const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
 			host.showError(errorMessage);
 		}
+		// A queued submit is otherwise invisible: nothing subscribes to queue_update,
+		// so the display is push-based and the text would leave no trace at all.
+		host.updatePendingMessagesDisplay();
+		host.ui.requestRender();
 	};
 
 	wireEditorSubmitHandler(host, onSubmit);

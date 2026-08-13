@@ -374,3 +374,88 @@ test("input-controller: /tmp paths are not treated as slash commands (#3478)", a
 	assert.deepEqual(errors, []);
 	assert.deepEqual(prompted, ["/tmp/some-file.log"]);
 });
+
+/**
+ * Mirrors the real guard in agent-session-prompt.ts: prompt() re-reads
+ * isStreaming AFTER awaiting its extension-command and input-handler hooks, and
+ * throws when no streamingBehavior was declared. Without emulating that window a
+ * test can only pin the option literal, not the defect.
+ *
+ * Also records the queue depth each time the pending-messages display is
+ * refreshed, so the test can pin that the refresh runs after the message is
+ * queued. A refresh that runs first has the right call count and renders
+ * nothing.
+ */
+function installRacingPrompt(host: {
+	session: { isStreaming: boolean; prompt: any };
+	updatePendingMessagesDisplay: () => void;
+}) {
+	const queued: Array<{ text: string; mode: string }> = [];
+	const rendered: number[] = [];
+	const refresh = host.updatePendingMessagesDisplay.bind(host);
+	host.session.prompt = async (text: string, options?: any) => {
+		await Promise.resolve();
+		host.session.isStreaming = true;
+		if (!options?.streamingBehavior) {
+			throw new Error(
+				"Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.",
+			);
+		}
+		queued.push({ text, mode: options.streamingBehavior });
+	};
+	host.updatePendingMessagesDisplay = () => {
+		refresh();
+		rendered.push(queued.length);
+	};
+	return { queued, rendered };
+}
+
+test("input-controller: an idle submit that loses the streaming race is queued, not rejected", async () => {
+	const { host, errors } = createHost();
+	const { queued, rendered } = installRacingPrompt(host);
+
+	await host.defaultEditor.onSubmit("do the work");
+
+	// followUp, not steer: this submit observed an idle session, so the run it
+	// would steer is one the user never saw.
+	assert.deepEqual(queued, [{ text: "do the work", mode: "followUp" }]);
+	assert.deepEqual(errors, []);
+	// And the message has to be on screen by the time the refresh runs, or it
+	// leaves no trace anywhere.
+	assert.deepEqual(rendered, [1]);
+});
+
+test("input-controller: a submit that observed streaming is still queued as steer", async () => {
+	// The two branches differ deliberately; this pins that the observed-streaming
+	// branch was left alone.
+	const { host, promptOptions } = createHost();
+	host.session.isStreaming = true;
+
+	await host.defaultEditor.onSubmit("do the work");
+
+	assert.equal(promptOptions[0]?.streamingBehavior, "steer");
+});
+
+test("input-controller: submitPromptsDirectly reaches the same idle-submit site", async () => {
+	// A previous draft of this fix patched only the submitPromptsDirectly branch,
+	// which the real TUI never takes -- so it was a no-op for the reported bug.
+	const { host, promptCalls } = createMockHost();
+	setupEditorSubmitHandler(host as any);
+
+	await host.defaultEditor.onSubmit!("do the work");
+
+	assert.equal(promptCalls.length, 1);
+	assert.equal(promptCalls[0].options?.streamingBehavior, "followUp");
+});
+
+test("input-controller: an idle submit leaves the editor empty", async () => {
+	// Editor.submitValue() clears before calling onSubmit, but Alt+Enter's idle
+	// case arrives via CustomEditor.onAction, which does not -- so without this the
+	// submitted text stays in the editor and can be sent twice.
+	const { host, getEditorText } = createHost();
+	host.editor.setText("do the work");
+
+	await host.defaultEditor.onSubmit("do the work");
+
+	assert.equal(getEditorText(), "");
+});
