@@ -50,6 +50,8 @@ Full build, link and rebase procedure: **[FORK.md](FORK.md)**.
 | 15 | `2f925973` | milestone-lease reentrancy across the process split | not filed |
 | 16 | `3f59fd4b` | DB-authoritative plan-milestone verification | not filed |
 | 17 | `a906814c` | milestone-scoped derivation vs. out-of-scope dependencies | not filed |
+| 18 | `21209a67` | first-strike abort for evidence cross-reference contradictions | not filed |
+| 19 | `d46ce3d7` | per-condition diagnosis for a refused recovery resume | not filed |
 
 Patch 8 spans **two** commits: `d44f1275` (`test(mcp-server): pin elicitation
 behaviour across client capability shapes`) lands `elicitation-capability.test.ts`

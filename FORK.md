@@ -434,8 +434,28 @@ node --import ./src/resources/extensions/gsd/tests/resolve-ts.mjs \
      src/resources/extensions/gsd/tests/plan-milestone-artifact-verification.test.ts \
      src/tests/headless-doctor-args.test.ts \
      src/resources/extensions/gsd/tests/derive-state-db.test.ts \
-     src/resources/extensions/gsd/tests/state-projection-scoped-write.test.ts
+     src/resources/extensions/gsd/tests/state-projection-scoped-write.test.ts \
+     src/resources/extensions/gsd/tests/safety-evidence-block-recovery-1641.test.ts \
+     src/resources/extensions/gsd/tests/recovery-policy.test.ts \
+     src/resources/extensions/gsd/tests/auto-recovery.test.ts \
+     src/resources/extensions/gsd/tests/task-recovery-resume-diagnosis.test.ts
 ```
+
+> The last four arrived with patches 18 and 19. Patch 18 redefines a shared
+> value -- the recovery `action` an evidence contradiction routes -- so per
+> [When a patch redefines a shared value](#when-a-patch-redefines-a-shared-value)
+> the list carries the upstream suites that exercise it, not just the fork's own
+> tests. `auto-recovery.test.ts` is on the list for exactly that reason: patch 18
+> changes what `readTerminalTaskRecoveryAbort` returns on a first strike, which
+> is a second subsystem the patch does not otherwise touch. It also carries one
+> pre-existing failure on this host, `plan-slice artifact resolution handles
+> lowercase unit IDs against uppercase paths` -- measured 86 of 89 on both the
+> patched tree and a clean one.
+>
+> Also worth running after any change to this family, though not on the list:
+> `auto-loop.test.ts` (121 of 129 on this host, identical clean and patched),
+> `auto-task-execution-cutover.test.ts`, `auto-verification.test.ts` and
+> `custom-task-host-verification.test.ts` (all clean).
 
 Patch 15 also lands a case in the `claude-code-cli` tree, which the
 `resolve-ts.mjs` hook resolves fine despite shipping under `gsd/tests/`:
