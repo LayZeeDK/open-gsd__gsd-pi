@@ -25,6 +25,9 @@ export interface EvidenceMismatch {
   reason: string;
 }
 
+/** Fraction of the claimed command's significant tokens a run must share. */
+const TOKEN_MATCH_THRESHOLD = 0.5;
+
 // ─── Public API ─────────────────────────────────────────────────────────────
 
 /**
@@ -89,6 +92,29 @@ export function crossReferenceEvidence(
     // Exit code mismatch: LLM claims success but actual command failed
     const match = latestMatch(commandRuns);
     if (claimed.exitCode === 0 && match.exitCode !== 0) {
+      // `findMatches` returns the FIRST tier that produced any hit, so a
+      // higher-tier match on an older failed run hides a lower-tier match on a
+      // newer successful one. That is not hypothetical: a corrected re-run
+      // legitimately differs from the claim — dropping an already-completed
+      // `nx build X &&` prefix, or fixing an argument inside the check — so it
+      // falls to the token tier while the original failure still matches by
+      // substring. Blocking on the stale failure then refuses a verification
+      // that actually passed.
+      const supersedingRun = findLaterSuccessfulRerun(claimed.command, bashCalls, match.timestamp);
+      if (supersedingRun) {
+        // Downgraded, not dropped: the operator still sees that an earlier run
+        // of this command failed, but a later matching run passed, so this must
+        // not block the unit.
+        mismatches.push({
+          severity: "warning",
+          claimed,
+          actual: supersedingRun,
+          reason:
+            `Claimed exitCode=0; an earlier matching run exited ${match.exitCode}, ` +
+            `but a later matching run exited 0 — treating the newer run as the verification`,
+        });
+        continue;
+      }
       mismatches.push({
         severity: "error",
         claimed,
@@ -195,7 +221,7 @@ function findMatches(
     const callTokens = new Set(call.command.split(/\s+/));
     const matchCount = claimedTokens.filter(t => callTokens.has(t)).length;
     const score = matchCount / claimedTokens.length;
-    if (score >= 0.5) {
+    if (score >= TOKEN_MATCH_THRESHOLD) {
       scoredMatches.push({ call, score });
     }
   }
@@ -204,6 +230,36 @@ function findMatches(
   return scoredMatches
     .filter((match) => match.score === bestScore)
     .map((match) => match.call);
+}
+
+/**
+ * The newest SUCCESSFUL run after `afterTimestamp` that still looks like the
+ * claimed command, judged by token overlap.
+ *
+ * Deliberately one-directional: this can only relax a block, never create one.
+ * It is consulted solely when an exit-code contradiction has already been found,
+ * so a loose match here cannot manufacture a new mismatch — it can only reveal
+ * that the contradiction was against a superseded run.
+ */
+function findLaterSuccessfulRerun(
+  claimedCommand: string,
+  bashCalls: readonly BashEvidence[],
+  afterTimestamp: number,
+): BashEvidence | null {
+  const claimedTokens = claimedCommand.trim().split(/\s+/).filter((t) => t.length > 2);
+  if (claimedTokens.length === 0) return null;
+
+  let best: BashEvidence | null = null;
+  for (const call of bashCalls) {
+    if (call.exitCode !== 0) continue;
+    if (call.timestamp < afterTimestamp) continue;
+    if (isInfraSpawnFailure(call)) continue;
+    const callTokens = new Set(call.command.split(/\s+/));
+    const matched = claimedTokens.filter((t) => callTokens.has(t)).length;
+    if (matched / claimedTokens.length < TOKEN_MATCH_THRESHOLD) continue;
+    if (!best || call.timestamp >= best.timestamp) best = call;
+  }
+  return best;
 }
 
 function latestMatch(matches: readonly BashEvidence[]): BashEvidence {

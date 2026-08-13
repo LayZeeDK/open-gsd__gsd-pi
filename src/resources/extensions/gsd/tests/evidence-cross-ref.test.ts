@@ -314,3 +314,101 @@ test("claimed command absent from bash calls reports a warning mismatch with nul
   assert.equal(missing.length, 1);
   assert.equal(missing[0].actual, null);
 });
+
+test("a corrected re-run supersedes the failure it replaced instead of blocking", () => {
+  // The exact shape recorded in a wedged consumer project: the claimed
+  // verification is a compound command; its first run failed on a bad argument;
+  // the agent fixed the argument and re-ran only the check, dropping the
+  // already-completed build prefix. The failed run still matches the claim by
+  // SUBSTRING, and `findMatches` returns the first tier that hits — so the
+  // newer, successful run (which only matches on tokens) was never consulted
+  // and a verification that genuinely passed was refused.
+  const claimedCommand =
+    "nx build ngx-foundation-sites && node -e \"const sass=require('sass');" +
+    "const r=sass.compileString('@use theme;', {loadPaths:['dist/packages/ngx-foundation-sites']})\"";
+  const mismatches = crossReferenceEvidence(
+    [{ command: claimedCommand, exitCode: 0, verdict: "passed" }],
+    [
+      {
+        kind: "bash",
+        toolCallId: "call-1",
+        command: claimedCommand,
+        exitCode: 1,
+        outputSnippet: "",
+        timestamp: 1_786_617_938_147,
+      },
+      {
+        kind: "bash",
+        toolCallId: "call-2",
+        command:
+          "node -e \"const sass=require('sass');const r=sass.compileString('@use theme;', " +
+          "{loadPaths:['dist/packages']})\"",
+        exitCode: 0,
+        outputSnippet: "bytes: 0",
+        timestamp: 1_786_617_938_155,
+      },
+    ] as EvidenceEntry[],
+  );
+
+  // Downgraded, not dropped: only `error` severity blocks the unit.
+  assert.equal(mismatches.length, 1);
+  assert.equal(mismatches[0]!.severity, "warning");
+  assert.match(mismatches[0]!.reason, /a later matching run exited 0/);
+  assert.equal(mismatches[0]!.actual?.toolCallId, "call-2");
+});
+
+test("an earlier success does not excuse a later failure of the same command", () => {
+  // The relaxation must be one-directional. A run that succeeded BEFORE the
+  // failure is not a re-verification of it.
+  const mismatches = crossReferenceEvidence(
+    [{ command: "npm test", exitCode: 0, verdict: "passed" }],
+    [
+      {
+        kind: "bash",
+        toolCallId: "call-1",
+        command: "npm test",
+        exitCode: 0,
+        outputSnippet: "ok",
+        timestamp: 1_000,
+      },
+      {
+        kind: "bash",
+        toolCallId: "call-2",
+        command: "npm test",
+        exitCode: 1,
+        outputSnippet: "failed",
+        timestamp: 2_000,
+      },
+    ] as EvidenceEntry[],
+  );
+
+  assert.equal(mismatches.length, 1);
+  assert.equal(mismatches[0]!.severity, "error", "a stale success must not unblock a real failure");
+});
+
+test("an unrelated later success does not excuse a failure", () => {
+  const mismatches = crossReferenceEvidence(
+    [{ command: "npm run build:production", exitCode: 0, verdict: "passed" }],
+    [
+      {
+        kind: "bash",
+        toolCallId: "call-1",
+        command: "npm run build:production",
+        exitCode: 1,
+        outputSnippet: "failed",
+        timestamp: 1_000,
+      },
+      {
+        kind: "bash",
+        toolCallId: "call-2",
+        command: "git status --short",
+        exitCode: 0,
+        outputSnippet: "",
+        timestamp: 2_000,
+      },
+    ] as EvidenceEntry[],
+  );
+
+  assert.equal(mismatches.length, 1);
+  assert.equal(mismatches[0]!.severity, "error", "an unrelated command must not count as a re-run");
+});
