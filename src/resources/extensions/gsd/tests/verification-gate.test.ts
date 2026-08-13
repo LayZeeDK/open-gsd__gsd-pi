@@ -22,7 +22,7 @@ import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { discoverCommands, runVerificationGate, runVerificationGateForTargets, formatFailureContext, captureRuntimeErrors, runDependencyAudit, isLikelyCommand, resolveVerificationShell, validateVerificationCommand } from "../verification-gate.ts";
+import { discoverCommands, runVerificationGate, runVerificationGateForTargets, formatFailureContext, captureRuntimeErrors, runDependencyAudit, isLikelyCommand, resolveVerificationShell, validateVerificationCommand, truncate } from "../verification-gate.ts";
 import type { CaptureRuntimeErrorsOptions, DependencyAuditOptions } from "../verification-gate.ts";
 import { validatePreferences } from "../preferences.ts";
 
@@ -549,6 +549,65 @@ describe("verification-gate: execution", () => {
     assert.equal(result.checks[0].exitCode, 0);
     assert.equal(result.checks[1].exitCode, 1);
     assert.ok(result.checks[1].stderr.includes("err"));
+  });
+
+  test("captured output over 10 KB keeps the end, where the error is", () => {
+    // The capture-time cut is the one that cannot be undone: once the tail is
+    // dropped here, no later consumer can recover it -- not the operator's
+    // abort, not the retry context, not the evidence JSON, not a replan unit.
+    // 12 KB of progress output, then the line that says what actually broke.
+    const script = [
+      "for (let i = 0; i < 400; i++) console.error('progress line ' + i + ' ................................');",
+      "console.error('Error: cannot find stylesheet to import');",
+      "process.exit(1);",
+    ].join("");
+    const result = withRtkDisabled(() => runVerificationGate({
+      cwd: tmp,
+      preferenceCommands: [`node -e "${script.replace(/"/g, '\\"')}"`],
+    }));
+
+    assert.equal(result.passed, false);
+    const stderr = result.checks[0].stderr;
+    assert.ok(stderr.includes("bytes truncated]"), "the fixture must actually exceed the cap");
+    assert.ok(
+      stderr.includes("Error: cannot find stylesheet to import"),
+      "the last line, which says why the check failed, must survive",
+    );
+    assert.ok(stderr.includes("progress line 0 "), "the start survives too");
+
+    // stderr used to be capped twice -- once per branch above, then again after
+    // the warning was appended. The second middle cut landed on the first cut's
+    // marker, so the survivor reported only what the second pass dropped: tens
+    // of bytes where tens of kilobytes went missing.
+    const markers = stderr.match(/bytes truncated\]/g) ?? [];
+    assert.equal(markers.length, 1, `expected exactly one truncation marker, got ${markers.join(", ")}`);
+    const dropped = Number(/at least (\d+) bytes truncated/.exec(stderr)?.[1]);
+    assert.ok(dropped > 10_000, `marker must report the real loss, reported ${dropped}`);
+  });
+
+  test("truncation cuts on character boundaries, not mid-sequence", () => {
+    // Command output is full of multi-byte characters -- nx, vite and esbuild
+    // all draw boxes. A cut at an arbitrary byte offset decodes to U+FFFD, and
+    // the tail cut is a second chance to do it.
+    // The child builds the character itself (U+3042, 3 bytes in UTF-8, so most
+    // offsets land mid-character) so the command line stays pure ASCII -- passing
+    // it through the shell would be a Windows console-encoding test instead.
+    const script = [
+      "const wide = String.fromCharCode(0x3042).repeat(20);",
+      "for (let i = 0; i < 400; i++) console.error(wide + i);",
+      "process.exit(1);",
+    ].join("");
+    const result = withRtkDisabled(() => runVerificationGate({
+      cwd: tmp,
+      preferenceCommands: [`node -e "${script.replace(/"/g, '\\"')}"`],
+    }));
+
+    const stderr = result.checks[0].stderr;
+    assert.ok(stderr.includes("bytes truncated]"), "the fixture must actually exceed the cap");
+    assert.ok(
+      !stderr.includes(String.fromCharCode(0xfffd)),
+      "no replacement characters may be introduced by either cut",
+    );
   });
 
   test("grep -c zero-match failure includes absence-check warning", () => {
@@ -1091,7 +1150,142 @@ test("formatFailureContext: truncates stderr longer than 2000 chars", () => {
   const output = formatFailureContext(result);
   // The output should contain 2000 x's followed by truncation marker, not 3000
   assert.ok(!output.includes("x".repeat(2001)), "should not contain more than 2000 chars of stderr");
-  assert.ok(output.includes("…[truncated]"), "should include truncation marker");
+  assert.ok(output.includes("[at least 1000 bytes truncated]"), "should include truncation marker");
+});
+
+test("formatFailureContext: a value cut twice does not understate the loss", () => {
+  // These cuts layer: capture caps at 10 KB for storage, then this caps the
+  // result again at 2,000 for the prompt. The value arriving here already
+  // carries a marker, and that marker lands in the middle this cut drops -- so
+  // counting only our own loss would tell the reader 8 KB went missing when the
+  // real figure was 42 KB.
+  const captured = truncate(
+    ["HEAD-LINE", "noise".repeat(9_000), "Error: cannot find stylesheet to import"].join("\n"),
+    10 * 1024,
+  );
+  const result: import("../types.ts").VerificationResult = {
+    passed: false,
+    checks: [{ command: "nx build && node -e ...", exitCode: 1, stdout: "", stderr: captured, durationMs: 100 }],
+    discoverySource: "preference",
+    timestamp: Date.now(),
+  };
+
+  const output = formatFailureContext(result);
+
+  assert.ok(
+    output.includes("Error: cannot find stylesheet to import"),
+    "the reason must survive both cuts, which is the point of the patch",
+  );
+  assert.match(output, /at least \d+ bytes truncated/, "a layered count cannot claim to be exact");
+  assert.equal(
+    (output.match(/bytes truncated\]/g) ?? []).length,
+    1,
+    "the inner marker is dropped by the outer cut, so only one may remain",
+  );
+});
+
+test("truncate: never returns more than it was given", () => {
+  // The band just above the budget is where cutting stops paying: the marker
+  // costs more than the bytes it removes. An estimated bound on the marker was
+  // wrong by one byte and let the pathology through at exactly 2033, so assert
+  // the invariant across the band rather than at one size.
+  for (let size = 2_000; size <= 2_060; size += 1) {
+    const input = "a".repeat(size);
+    const output = truncate(input, 2_000);
+    assert.ok(
+      output.length <= input.length,
+      `truncate(${size}) returned ${output.length}, longer than its input`,
+    );
+  }
+  // Well past the band it must still actually cut.
+  assert.ok(truncate("a".repeat(9_000), 2_000).length < 9_000);
+});
+
+test("truncate: the tail starts on a line boundary when one is in reach", () => {
+  // A byte-aligned cut opens the excerpt mid-line. Command output is full of ANSI
+  // escapes, so it can open inside one -- printing literal escape text, or
+  // swallowing what follows it.
+  const lines = Array.from({ length: 400 }, (_, i) => `line ${i} ${"-".repeat(40)}`);
+  const output = truncate(lines.join("\n"), 2_000);
+  const tail = output.slice(output.indexOf("bytes truncated]") + "bytes truncated]".length + 1);
+
+  assert.ok(tail.startsWith("line "), `tail opened mid-line: ${JSON.stringify(tail.slice(0, 30))}`);
+});
+
+test("truncate: output with no newline at all still cuts", () => {
+  // The line snap must not be load-bearing: a single enormous line keeps the byte
+  // boundary rather than losing the whole tail.
+  const output = truncate("x".repeat(9_000), 2_000);
+
+  assert.ok(output.includes("bytes truncated]"));
+  assert.ok(output.length < 9_000);
+});
+
+test("truncate: a budget too small for the marker keeps content, not the marker", () => {
+  // Otherwise the marker is all that fits and 100% of the content is discarded
+  // silently. Reachable from a computed budget, which the exported function now
+  // invites.
+  for (const maxBytes of [0, 1, 20, 40]) {
+    const output = truncate("z".repeat(500), maxBytes);
+    assert.ok(!output.includes("bytes truncated]"), `maxBytes=${maxBytes} returned only a marker`);
+    assert.ok(output.length <= 500, `maxBytes=${maxBytes} grew the input`);
+    if (maxBytes > 0) {
+      assert.ok(output.includes("z"), `maxBytes=${maxBytes} discarded every byte of content`);
+    }
+  }
+});
+
+test("truncate: never returns more than it was given, counted in characters", () => {
+  // The ASCII sweep above cannot see this: bytes and chars coincide there. With
+  // a 3-byte character the input can shrink in BYTES while growing in CHARS,
+  // and callers such as MAX_FAILURE_CONTEXT_CHARS budget in chars.
+  const wide = String.fromCharCode(0x3042);
+  for (let chars = 660; chars <= 700; chars += 1) {
+    const input = wide.repeat(chars);
+    const output = truncate(input, 2_000);
+    assert.ok(
+      output.length <= input.length,
+      `truncate(${chars} chars / ${Buffer.byteLength(input)} bytes) returned ${output.length} chars`,
+    );
+  }
+});
+
+test("formatFailureContext: a barely-over-budget check is not cut at all", () => {
+  // The marker costs more than a cut this small recovers, so cutting would make
+  // the value LONGER than the input it was asked to shrink, and cost the reader
+  // a line of real output to be told a few bytes went missing.
+  const stderr = "y".repeat(2_010);
+  const result: import("../types.ts").VerificationResult = {
+    passed: false,
+    checks: [{ command: "just-over", exitCode: 1, stdout: "", stderr, durationMs: 100 }],
+    discoverySource: "preference",
+    timestamp: Date.now(),
+  };
+
+  const output = formatFailureContext(result);
+
+  assert.ok(!output.includes("bytes truncated]"), "must not insert a marker that costs more than it saves");
+  assert.ok(output.includes(stderr), "the whole output survives");
+});
+
+test("formatFailureContext: an over-budget check keeps the END of its output", () => {
+  // A failing command prints its error last. Keeping only the head -- which this
+  // did -- reports the progress log and discards the diagnosis.
+  const stderr = ["FIRST-LINE", "noise".repeat(1000), "Error: cannot find stylesheet to import"].join("\n");
+  const result: import("../types.ts").VerificationResult = {
+    passed: false,
+    checks: [{ command: "nx build && node -e ...", exitCode: 1, stdout: "", stderr, durationMs: 100 }],
+    discoverySource: "preference",
+    timestamp: Date.now(),
+  };
+
+  const output = formatFailureContext(result);
+
+  assert.ok(
+    output.includes("Error: cannot find stylesheet to import"),
+    "the reason the check failed must survive truncation",
+  );
+  assert.ok(output.includes("FIRST-LINE"), "the start is still worth keeping, so both ends survive");
 });
 
 test("formatFailureContext: returns empty string when all checks pass", () => {

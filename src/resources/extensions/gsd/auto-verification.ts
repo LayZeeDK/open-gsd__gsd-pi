@@ -38,6 +38,7 @@ import {
   formatFailureSignature,
   captureRuntimeErrors,
   runDependencyAudit,
+  truncate as truncateVerificationOutput,
 } from "./verification-gate.js";
 import type { VerificationTarget, TaskVerificationEvidence } from "./verification-gate.js";
 import { writeVerificationJSON, type PostExecutionCheckJSON, type EvidenceJSON } from "./verification-evidence.js";
@@ -1003,8 +1004,18 @@ export async function runPostUnitVerification(
         );
         for (const f of failures) {
           process.stderr.write(`  ${f.command} exited ${f.exitCode}\n`);
+          // Head-slicing here would undo the byte cut upstream: the first 500
+          // chars of a failing command are its progress log, so the operator
+          // would still never see the line that says what broke.
+          //
+          // Known limit: keeping the tail means it can begin inside an ANSI
+          // escape, which head-slicing could only ever end inside. Verification
+          // output is escape-heavy, so a few garbage characters can lead the
+          // excerpt. Not worth a sequence parser to avoid -- this whole surface
+          // is rewritten by the abort-message patch, which is where a reset or a
+          // line-aligned cut belongs if it is still worth having.
           if (f.stderr)
-            process.stderr.write(`  stderr: ${f.stderr.slice(0, 500)}\n`);
+            process.stderr.write(`  stderr: ${truncateVerificationOutput(f.stderr, 500)}\n`);
         }
       }
     }
@@ -1293,7 +1304,7 @@ export async function runPostUnitVerification(
         .filter((c) => c.exitCode !== 0)
         .map((c) => ({
           kind: "gate" as const,
-          message: `${c.command} exited ${c.exitCode}${c.stderr ? `: ${c.stderr.slice(0, 200)}` : ""}`,
+          message: `${c.command} exited ${c.exitCode}${c.stderr ? `: ${truncateVerificationOutput(c.stderr, 200)}` : ""}`,
         }));
       const runtimeFailures = (result.runtimeErrors ?? [])
         .filter((e) => e.blocking)

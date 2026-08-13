@@ -16,16 +16,113 @@ import {
   stripMcpToolPrefix,
 } from "./workflow-tool-surface.js";
 
-/** Maximum bytes of stdout/stderr to retain per command (10 KB). */
+/** Target bytes of stdout/stderr retained per command. See `truncate` for the bound. */
 const MAX_OUTPUT_BYTES = 10 * 1024;
 
-/** Truncate a string to maxBytes, appending a marker if truncated. */
-function truncate(value: string | null | undefined, maxBytes: number): string {
+/** Share of a truncation budget kept from the start; the remainder is kept from the end. */
+const TRUNCATION_HEAD_SHARE = 0.3;
+
+/** Below this budget the marker would cost more than the content it describes. */
+const TRUNCATION_MARKER_FLOOR_BYTES = 64;
+
+/**
+ * Truncate to maxBytes by dropping the MIDDLE, keeping both ends.
+ *
+ * `maxBytes` bounds the retained OUTPUT, not the returned string: the inserted
+ * marker sits on top of it. The guarantee is that the result is never longer
+ * than the input, which is what the callers actually need. The overshoot is the
+ * marker, about 35 bytes. The no-cut band above is wider than that, because the
+ * result must shrink in characters as well as bytes: at a 200-byte budget a
+ * value up to about 1.5x it is returned whole, falling to about 1.05x at 2,000.
+ *
+ * Operates on UTF-8 bytes, so the encode step normalises a lone surrogate to
+ * U+FFFD before any cut happens. Unreachable from the gate, whose values come
+ * pre-decoded from spawnSync, but it is part of the contract now this is
+ * exported.
+ *
+ * Keeping only the head -- which this did -- discards the part that says what
+ * went wrong. A failing command prints its error last, after whatever progress
+ * output came before it, and a compound `a && b` is the worst case: a's log
+ * fills the budget and b's error, the reason the check failed, is thrown away.
+ * Nothing downstream can recover it, so the operator, the retry context and
+ * the recovery record all get the progress log instead of the diagnosis. (The
+ * evidence JSON is unaffected: verification-evidence.ts excludes stdout/stderr
+ * by design.)
+ *
+ * Keeping only the tail would fix that shape and break the opposite one (a
+ * compiler that reports errors first and then a summary), so keep both ends and
+ * drop the middle. The split favours the tail because errors skew late.
+ */
+export function truncate(value: string | null | undefined, maxBytes: number): string {
   if (!value) return "";
+  // Measure before allocating: this runs on every check's stdout and stderr at
+  // capture, where most values are under budget and copying them is pure cost.
   if (Buffer.byteLength(value, "utf-8") <= maxBytes) return value;
-  // Slice conservatively then trim to last full character
-  const buf = Buffer.from(value, "utf-8").subarray(0, maxBytes);
-  return buf.toString("utf-8") + "\n…[truncated]";
+  const buf = Buffer.from(value, "utf-8");
+  // A budget too small to carry the marker would otherwise return the marker and
+  // none of the content -- total silent loss. Keep the end and say nothing. No
+  // current caller is near this, but the budget is a parameter of an exported
+  // function and a computed one (`CAP - header.length`) can land here.
+  if (maxBytes < TRUNCATION_MARKER_FLOOR_BYTES) {
+    return buf.subarray(nextCharBoundary(buf, buf.byteLength - maxBytes)).toString("utf-8");
+  }
+  // Both cuts land on arbitrary byte offsets, so move them to character
+  // boundaries first. Otherwise a multi-byte character straddling a cut decodes
+  // to U+FFFD, and command output is full of them (nx, vite and esbuild all draw
+  // boxes). The head cut always had this; the tail cut would add a second.
+  const headEnd = priorCharBoundary(buf, Math.floor(maxBytes * TRUNCATION_HEAD_SHARE));
+  let tailStart = Math.max(headEnd, nextCharBoundary(buf, buf.byteLength - (maxBytes - headEnd)));
+  // Prefer starting the tail on a line boundary. A byte-aligned cut opens the
+  // excerpt mid-line, and command output is full of ANSI escapes, so it can open
+  // inside one -- printing literal escape text, or swallowing what follows. The
+  // repo's own tool-output truncator cuts at line boundaries for the same reason.
+  // Bounded, so a long line cannot cost the whole tail; unterminated output with
+  // no newline at all keeps the byte boundary.
+  const lineSnapLimit = Math.floor(maxBytes / 10);
+  const nextNewline = buf.indexOf(0x0a, tailStart);
+  if (nextNewline !== -1 && nextNewline + 1 < buf.byteLength && nextNewline - tailStart <= lineSnapLimit) {
+    tailStart = nextNewline + 1;
+  }
+  // "at least", because these cuts layer. Capture caps at 10 KB for storage and
+  // the display sites cap the result again at 2,000 / 500 / 200, so the value
+  // arriving here often already carries a marker -- which then lands in the
+  // middle this cut drops. Counting only our own loss would report 8 KB where 42
+  // KB went missing. Summing the inner count instead would be exact only while
+  // the marker keeps landing in the dropped middle, which is a silent dependency
+  // on the budget ratios; a weaker claim that cannot go stale is worth more here
+  // than a precise one that can.
+  const cut = [
+    buf.subarray(0, headEnd).toString("utf-8"),
+    `...[at least ${tailStart - headEnd} bytes truncated]`,
+    buf.subarray(tailStart).toString("utf-8"),
+  ].join("\n");
+  // Cutting only pays when the marker costs less than the bytes it removes; just
+  // over the budget it does not, and the reader would lose a line of real output
+  // to be told that one byte went missing. Measure rather than estimate -- an
+  // approximate bound on the marker was wrong by a byte and the pathology
+  // survived it.
+  // Both units: a multi-byte input can shrink in bytes while growing in chars,
+  // and callers such as MAX_FAILURE_CONTEXT_CHARS budget in chars.
+  return Buffer.byteLength(cut, "utf-8") < buf.byteLength && cut.length < value.length ? cut : value;
+}
+
+/** True for a UTF-8 continuation byte, i.e. a byte that cannot start a character. */
+function isContinuationByte(byte: number | undefined): boolean {
+  return byte !== undefined && (byte & 0xc0) === 0x80;
+}
+
+/** Move an index forward to the next UTF-8 character boundary at or after it. */
+function nextCharBoundary(buf: Buffer, index: number): number {
+  let i = Math.max(0, index);
+  while (i < buf.byteLength && isContinuationByte(buf[i])) i += 1;
+  return i;
+}
+
+/** Move an index back to the UTF-8 character boundary at or before it. */
+function priorCharBoundary(buf: Buffer, index: number): number {
+  let i = Math.min(index, buf.byteLength);
+  while (i > 0 && isContinuationByte(buf[i])) i -= 1;
+  return i;
 }
 
 // ─── Command Discovery ──────────────────────────────────────────────────────
@@ -248,10 +345,10 @@ function hasPythonTests(dir: string): boolean {
 
 // ─── Failure Context Formatting ──────────────────────────────────────────────
 
-/** Maximum chars of command output to include per failed check. */
+/** Target bytes of command output retained per failed check. See `truncate` for the bound. */
 const MAX_FAILURE_OUTPUT_PER_CHECK = 2_000;
 
-/** Maximum total chars for the combined failure context output. */
+/** Maximum total chars for the combined failure context. */
 const MAX_FAILURE_CONTEXT_CHARS = 10_000;
 
 /**
@@ -259,7 +356,8 @@ const MAX_FAILURE_CONTEXT_CHARS = 10_000;
  *
  * Each failed check gets a heading with the command name and exit code,
  * followed by a truncated stderr excerpt. Individual stderr is capped to
- * 2 000 chars; total output is capped to 10 000 chars.
+ * about 2 000 bytes (`truncate` bounds the retained output, not the returned
+ * string); total output is capped to 10 000 chars.
  *
  * Returns an empty string when all checks pass or the checks array is empty.
  */
@@ -272,10 +370,11 @@ export function formatFailureContext(result: VerificationResult): string {
   for (const check of failures) {
     const hasStderr = (check.stderr ?? "").trim().length > 0;
     const outputLabel = hasStderr ? "stderr" : "stdout";
-    let output = hasStderr ? check.stderr ?? "" : check.stdout ?? "";
-    if (output.length > MAX_FAILURE_OUTPUT_PER_CHECK) {
-      output = output.slice(0, MAX_FAILURE_OUTPUT_PER_CHECK) + "\n…[truncated]";
-    }
+    // Same reasoning as the capture-time cut: this is one command's own output,
+    // so the end is the part worth keeping. The TOTAL cap below is left alone --
+    // it drops whole later checks, and the first failure is usually the root
+    // cause with the rest cascading from it.
+    const output = truncate(hasStderr ? check.stderr ?? "" : check.stdout ?? "", MAX_FAILURE_OUTPUT_PER_CHECK);
 
     blocks.push(
       `### ❌ \`${check.command}\` (exit code ${check.exitCode})\n\`\`\`${outputLabel}\n${output}\n\`\`\``,
@@ -868,7 +967,7 @@ function mergeDiscoverySource(
  *
  * - All commands run sequentially regardless of individual pass/fail.
  * - `passed` is true when every command exits 0 (or no commands are discovered).
- * - stdout/stderr per command are truncated to 10 KB.
+ * - stdout/stderr per command are cut to about 10 KB (see `truncate`).
  */
 export function runVerificationGate(options: RunVerificationGateOptions): VerificationResult {
   const timestamp = Date.now();
@@ -909,17 +1008,18 @@ export function runVerificationGate(options: RunVerificationGateOptions): Verifi
     let exitCode: number;
     let stderr: string;
 
+    // Left uncapped here on purpose: the cap is applied once, at the push below,
+    // after the warning is appended. Truncating twice would put the second
+    // middle cut through the first cut's marker, leaving a marker that reports
+    // only what the second pass dropped -- 28 bytes where 34 KB went missing.
     if (result.error) {
       // Command not found or spawn failure
       exitCode = 127;
-      stderr = truncate(
-        (result.stderr || "") + "\n" + (result.error as Error).message,
-        MAX_OUTPUT_BYTES,
-      );
+      stderr = (result.stderr || "") + "\n" + (result.error as Error).message;
     } else {
       // status is null when killed by signal — treat as failure
       exitCode = result.status ?? 1;
-      stderr = truncate(result.stderr, MAX_OUTPUT_BYTES);
+      stderr = result.stderr ?? "";
     }
 
     const warning = countSearchWarning(command, exitCode);
