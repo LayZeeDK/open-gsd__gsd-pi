@@ -438,7 +438,8 @@ node --import ./src/resources/extensions/gsd/tests/resolve-ts.mjs \
      src/resources/extensions/gsd/tests/safety-evidence-block-recovery-1641.test.ts \
      src/resources/extensions/gsd/tests/recovery-policy.test.ts \
      src/resources/extensions/gsd/tests/auto-recovery.test.ts \
-     src/resources/extensions/gsd/tests/task-recovery-resume-diagnosis.test.ts
+     src/resources/extensions/gsd/tests/task-recovery-resume-diagnosis.test.ts \
+     src/resources/extensions/gsd/tests/task-recovery-relaunch.test.ts
 ```
 
 > The last four arrived with patches 18 and 19. Patch 18 redefines a shared
