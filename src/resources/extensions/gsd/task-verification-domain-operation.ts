@@ -65,6 +65,37 @@ export interface TaskTechnicalVerdictSnapshot {
   nextStage: "verify" | "route";
   operationId: string;
   resultingRevision: number;
+  /** `environment.verificationPolicy` from the verdict's evidence, when it
+   *  carries one. Callers that re-route a *stored* verdict need it to recover
+   *  which policy produced the verdict — notably `safety-evidence-xref`, whose
+   *  recovery kind differs from an ordinary host verification failure. */
+  verificationPolicy?: string;
+}
+
+/** The `environment.verificationPolicy` marker a safety evidence
+ *  cross-reference stamps on the verdict it records (`auto-verification.ts`). */
+export const SAFETY_EVIDENCE_XREF_POLICY = "safety-evidence-xref" as const;
+
+/**
+ * The recovery failure kind to route a *stored* failing verdict under.
+ *
+ * A safety evidence cross-reference records its failing verdict and routes it in
+ * one step, but the route can fail after the verdict commits. Every site that
+ * later re-routes that stored verdict must recover which policy produced it, or
+ * it downgrades a contradiction — which is unbudgeted and terminal by design —
+ * back to a budgeted `remediate` and buys the blind full re-run the dedicated
+ * failure kind exists to prevent.
+ *
+ * `fallback` stays with the caller: the sites differ in whether they can also
+ * mean `verification-drift`, and this must not change that choice.
+ */
+export function storedVerdictFailureKind<T extends string>(
+  verdict: Pick<TaskTechnicalVerdictSnapshot, "verificationPolicy"> | null | undefined,
+  fallback: T,
+): T | typeof SAFETY_EVIDENCE_XREF_POLICY {
+  return verdict?.verificationPolicy === SAFETY_EVIDENCE_XREF_POLICY
+    ? SAFETY_EVIDENCE_XREF_POLICY
+    : fallback;
 }
 
 interface AttemptScope {
@@ -130,7 +161,9 @@ export function readTaskTechnicalVerdict(attemptId: string): TaskTechnicalVerdic
   const stored = getDb().prepare(`
     SELECT verdict.verdict_id, evidence.evidence_id, verdict.verdict,
            verdict.tested_source_revision, verdict.operation_id,
-           verdict.project_revision, verdict.supersedes_verdict_id
+           verdict.project_revision, verdict.supersedes_verdict_id,
+           json_extract(evidence.environment_json, '$.verificationPolicy')
+             AS verification_policy
     FROM workflow_technical_verdicts verdict
     JOIN workflow_acceptance_criteria criterion
       ON criterion.criterion_id = verdict.criterion_id
@@ -166,6 +199,9 @@ export function readTaskTechnicalVerdict(attemptId: string): TaskTechnicalVerdic
     nextStage: verdict === "pass" ? "verify" : "route",
     operationId: String(stored["operation_id"]),
     resultingRevision: Number(stored["project_revision"]),
+    ...(typeof stored["verification_policy"] === "string"
+      ? { verificationPolicy: stored["verification_policy"] }
+      : {}),
   };
 }
 

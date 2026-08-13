@@ -22,6 +22,8 @@ import {
   isPendingTaskHumanReviewVerdict,
   readTaskTechnicalVerdict,
   recordTaskTechnicalVerdict,
+  SAFETY_EVIDENCE_XREF_POLICY,
+  storedVerdictFailureKind,
   type RecordTaskTechnicalVerdictInput,
   type TaskTechnicalVerdictReceipt,
 } from "../task-verification-domain-operation.js";
@@ -271,7 +273,8 @@ interface FailedVerdictIdentity {
 function routeFailedVerification(
   attempt: TaskExecutionAttemptSnapshot,
   verdict: FailedVerdictIdentity,
-  failureKind: "verification-failed" | "verification-drift" = "verification-failed",
+  failureKind: "verification-failed" | "verification-drift" | "safety-evidence-xref" =
+    "verification-failed",
   supersedesResolvedBlockerId?: string,
   onRecovery?: (recovery: HostVerificationRecovery) => void,
 ): VerificationOutcome {
@@ -289,7 +292,9 @@ function routeFailedVerification(
     classification: { failureKind },
     summary: failureKind === "verification-drift"
       ? "Stored custom-engine host verification pass no longer matches the current source"
-      : "Custom-engine host verification did not pass",
+      : failureKind === SAFETY_EVIDENCE_XREF_POLICY
+        ? "Recorded execution contradicts the verification the Task claimed"
+        : "Custom-engine host verification did not pass",
     evidence: {
       verdictId: verdict.verdictId,
       evidenceId: verdict.evidenceId,
@@ -424,7 +429,7 @@ async function runCustomTaskHostVerification(
       return routeFailedVerification(
         attempt,
         storedVerdict,
-        "verification-failed",
+        storedVerdictFailureKind(existing, "verification-failed"),
         blocker.blockerId,
         emitRouted({
           path: "stored-verdict-blocker-failed",
@@ -447,9 +452,16 @@ async function runCustomTaskHostVerification(
         }),
       );
     }
-    const failureKind = recovery?.failureKind === "verification-drift" || existing.supersedesVerdictId
-      ? "verification-drift"
-      : "verification-failed";
+    // `recovery` is legitimately null here (line 439 branches on exactly that),
+    // so this re-routes a stored verdict with no committed route — the state a
+    // safety evidence cross-reference leaves behind when its own route throws.
+    // See `storedVerdictFailureKind`.
+    const failureKind = storedVerdictFailureKind(
+      existing,
+      recovery?.failureKind === "verification-drift" || existing.supersedesVerdictId
+        ? "verification-drift"
+        : "verification-failed",
+    );
     const supersededBlockerId = readResolvedTaskHumanReviewBlocker(attempt.attemptId)?.blockerId;
     return routeFailedVerification(
       attempt,

@@ -22,6 +22,10 @@ import { classifyFailure } from "../recovery-classification.js";
 import type { PublishVerifiedTaskCompletionInput } from "../task-completion-compatibility-adapter.js";
 import { internalExecutionInvocation } from "../execution-invocation.js";
 import type { TaskTechnicalVerdictSnapshot } from "../task-verification-domain-operation.js";
+import {
+  SAFETY_EVIDENCE_XREF_POLICY,
+  storedVerdictFailureKind,
+} from "../task-verification-domain-operation.js";
 import type { UnitPhaseResult } from "./workflow-unit-dispatch.js";
 
 export interface TaskExecutionCutoverInput {
@@ -58,13 +62,19 @@ function routeStoredTechnicalFailure(
   if (verdict.verdict === "pass") {
     throw new Error("Task recovery cannot route a passing Technical Verdict");
   }
+  // The route that should have accompanied this verdict can fail after the
+  // verdict commits, so this is where a stored safety evidence cross-reference
+  // lands on the next dispatch. See `storedVerdictFailureKind`.
+  const failureKind = storedVerdictFailureKind(verdict, "verification-failed");
   return deps.routeTaskFailure({
     invocation: internalExecutionInvocation(`internal:auto:attempt.route:${attempt.resultId}`),
     attemptId: attempt.attemptId,
     resultId: attempt.resultId,
     owner: "agent",
-    classification: { failureKind: "verification-failed" },
-    summary: "Built-in host verification did not pass",
+    classification: { failureKind },
+    summary: failureKind === SAFETY_EVIDENCE_XREF_POLICY
+      ? "Recorded execution contradicts the verification the Task claimed"
+      : "Built-in host verification did not pass",
     evidence: {
       unitType: input.unitType,
       unitId: input.unitId,

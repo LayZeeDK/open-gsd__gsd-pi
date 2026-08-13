@@ -681,6 +681,42 @@ test("refreshRecoveryDbForArtifact refuses execute-task recovery after a termina
   assert.ok(result.message.includes("gsd recover"));
 });
 
+test("refreshRecoveryDbForArtifact refuses execute-task recovery on a FIRST safety evidence contradiction", () => {
+  const dir = makeTmpProject();
+  insertTask({ milestoneId: "M001", sliceId: "S01", id: "T01", title: "Task", status: "pending" });
+  const attempt = seedCanonicalTaskAttempt("failed");
+  assert.ok(attempt.resultId);
+
+  // `safety-evidence-xref` is unbudgeted, so this is terminal with no prior
+  // recovery history at all. While the contradiction was filed as
+  // `verification-failed` it routed a budgeted `remediate` on the first strike,
+  // `readTerminalTaskRecoveryAbort` returned null, and stuck recovery reported
+  // `execute-task-attempt-read-only-verified` — clearing the dispatch ring for
+  // a re-dispatch that carries no repair context and reproduces the identical
+  // contradiction at full cost.
+  const route = recordFailureAndSelectRecovery({
+    invocation: internalExecutionInvocation("test:artifact-recovery:route:evidence-xref"),
+    attemptId: attempt.attemptId,
+    resultId: attempt.resultId!,
+    owner: "agent",
+    classification: { failureKind: "safety-evidence-xref" },
+    summary: "Recorded execution contradicts the verification the Task claimed",
+    evidence: { unitType: "execute-task", unitId: "M001/S01/T01" },
+    rationale: "Route the contradiction through the durable recovery policy",
+  });
+  assert.equal(route.action, "abort", "the first contradiction must route terminal");
+  assert.equal(verifyExpectedArtifact("execute-task", "M001/S01/T01", dir), true);
+
+  const result = refreshRecoveryDbForArtifact("execute-task", "M001/S01/T01", dir);
+
+  assert.equal(result.ok, false);
+  if (result.ok) return;
+  assert.equal(result.fatal, true);
+  assert.equal(result.reason, "execute-task-recovery-aborted");
+  assert.ok(result.message.includes(route.recoveryActionId));
+  assert.ok(result.message.includes("gsd_task_recovery_resume"));
+});
+
 test("refreshRecoveryDbForArtifact closes complete-milestone DB row when artifacts exist but DB is stale (#5568)", async () => {
   const base = mkdtempSync(join(tmpdir(), "auto-recovery-complete-ms-"));
   mkdirSync(join(base, ".gsd"), { recursive: true });

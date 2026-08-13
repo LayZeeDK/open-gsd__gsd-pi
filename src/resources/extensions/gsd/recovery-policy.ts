@@ -26,6 +26,7 @@ export type TaskFailureKind =
   | RecoveryFailureKind
   | "transient-execution"
   | "verification-failed"
+  | "safety-evidence-xref"
   | "objective-uat"
   | "plan-invalid"
   | "fatal";
@@ -116,6 +117,13 @@ function budgetedRule(
       return { action: "remediate", policyClass: "remediation", maxUses: 2 };
     case "objective-uat":
       return { action: "retry", policyClass: "objective-uat", maxUses: 2 };
+    // `safety-evidence-xref` is deliberately absent. A contradiction between the
+    // verification a Task claimed and the execution the harness recorded cannot
+    // be cleared by running the same Task again — the re-dispatch carries no
+    // repair context, so it reproduces the same contradiction at full cost. It
+    // needs a repair plus evidence of that repair, which is the
+    // `gsd_task_recovery_resume` contract, so it falls through to a terminal
+    // abort on the first occurrence. Do not "fix" this gap by adding a budget.
     default:
       return null;
   }

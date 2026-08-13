@@ -8,7 +8,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import {
@@ -32,8 +32,10 @@ import {
   claimTaskAttempt,
   isTaskAttemptAwaitingVerification,
   readLatestTaskAttempt,
+  readTaskAttempt,
   settleTaskAttempt,
 } from "../task-execution-domain-operation.ts";
+import { runWithTaskExecutionAttempt } from "../auto/task-execution-cutover.ts";
 import { readTaskRecoveryRoute, recordFailureAndSelectRecovery } from "../task-recovery-domain-operation.ts";
 import {
   invalidateTaskTechnicalPass,
@@ -145,6 +147,15 @@ test("blocking evidence-xref settles and routes the Attempt with a surfaced reco
     );
 
     writeFileSync(join(base, "app.js"), "console.log('ready');\n");
+
+    // The persisted evidence file is the operator's only proof of the
+    // contradiction they are being asked to repair before resuming. It is
+    // cleared on retryable routes so a retry cross-references fresh execution
+    // (#1641), but a terminal abort has no retry to keep clean.
+    const evidenceFile = join(base, ".gsd", "safety", "evidence-M001-S01-T01.json");
+    mkdirSync(join(base, ".gsd", "safety"), { recursive: true });
+    writeFileSync(evidenceFile, "[]\n");
+
     resetEvidence();
     recordToolCall("call-1", "bash", { command: "npm test" });
     recordToolResult("call-1", "bash", "Command exited with code 1\nfailed\n", true);
@@ -179,6 +190,11 @@ test("blocking evidence-xref settles and routes the Attempt with a surfaced reco
     // The blocking branch returns the dedicated evidence-xref-blocked signal and pauses.
     assert.equal(result, "evidence-xref-blocked");
     assert.equal(pauseCalled, true);
+    assert.equal(
+      existsSync(evidenceFile),
+      true,
+      "a terminal abort must not delete the evidence the operator has to inspect",
+    );
 
     // The withheld verdict is durably recorded and the Attempt is routed out of
     // the awaiting-verification wedge — a resume no longer replays the
@@ -197,9 +213,17 @@ test("blocking evidence-xref settles and routes the Attempt with a surfaced reco
     assert.ok(route, "a recovery route must exist for the blocked Attempt");
     assert.ok(route.recoveryActionId.length > 0, "recoveryActionId must be minted");
     assert.equal(route.recoveryOwner, "agent");
+    // Both terms the cutover gate reads (task-execution-cutover.ts:443).
+    // `resumeAuthorized` means "has already been resumed", so a freshly minted
+    // abort must report false — that falsity is what makes the next dispatch
+    // break instead of claiming a fresh Attempt and re-running the whole task.
+    assert.equal(route.resumeAuthorized, false);
+    // The very first contradiction routes terminal, so the pause already names
+    // the tool that can actually clear it rather than a full re-run that cannot.
+    assert.equal(route.action, "abort");
     assert.deepEqual(s.lastSafetyBlockRecovery, {
       recoveryActionId: route.recoveryActionId,
-      resumeInstruction: 'resume with /gsd auto to re-run the task',
+      resumeInstruction: 'resume with gsd_task_recovery_resume',
     });
 
     // The pause notification carries the recoveryActionId and a resume
@@ -220,7 +244,7 @@ test("blocking evidence-xref settles and routes the Attempt with a surfaced reco
     // complete-and-break, so the loop stops before the verified-task
     // publication boundary — the "Verified Task publication requires a passing
     // host Technical Verdict" throw is unreachable on this path.
-    const safetyReason = `safety-evidence-block (recoveryActionId: ${route.recoveryActionId}; resume with /gsd auto to re-run the task)`;
+    const safetyReason = `safety-evidence-block (recoveryActionId: ${route.recoveryActionId}; resume with gsd_task_recovery_resume)`;
     const decision = decideFinalizeResult({ action: "break", reason: safetyReason });
     assert.equal(decision.action, "stop");
   } finally {
@@ -230,7 +254,64 @@ test("blocking evidence-xref settles and routes the Attempt with a surfaced reco
   }
 });
 
-test("evidence routing failure surfaces a supported retry instruction", (t) => {
+test("an evidence contradiction routes an unbudgeted abort under its own failure kind", (t) => {
+  const base = makeTempRepo("gsd-evidence-budget-");
+  t.after(() => {
+    closeDatabase();
+    cleanup(base);
+  });
+  openDatabase(":memory:");
+  insertMilestone({ id: "M001", title: "Milestone", status: "active" });
+  insertSlice({ id: "S01", milestoneId: "M001", title: "Slice", status: "active" });
+  insertTask({ id: "T01", sliceId: "S01", milestoneId: "M001", title: "Task", status: "complete" });
+  const attemptId = settleCanonicalTaskForHostVerification(base);
+  const attempt = readLatestTaskAttempt({ ...TASK });
+  assert.ok(attempt);
+  assert.ok(attempt.resultId);
+
+  const routed = routeEvidenceCrossReferenceBlock({
+    attempt: attempt!,
+    basePath: base,
+    mismatch: {
+      command: "npm test",
+      claimedExitCode: 0,
+      actualExitCode: 1,
+      reason: "Claimed exitCode=0 but actual exitCode=1",
+    },
+  });
+
+  assert.equal(routed.outcome, "abort");
+  assert.equal(routed.action, "abort");
+
+  // The observation is filed under the dedicated kind and binds no recovery
+  // budget row. Under `verification-failed` it bound the `remediation` budget,
+  // whose uses are counted per (lifecycle, failureKind, fingerprint,
+  // policyClass) — i.e. per Task, across Attempts — so a contradiction shared
+  // its allowance with every ordinary host verification failure on the same
+  // Task and the number of wasted full re-runs before a resumable abort
+  // depended on unrelated history. With no budget bound, `budgetUses` cannot
+  // reach this decision at all.
+  const stored = _getAdapter()!.prepare(`
+    SELECT observation.failure_kind, action.action, action.recovery_budget_id
+    FROM workflow_recovery_actions action
+    JOIN workflow_failure_observations observation
+      ON observation.failure_observation_id = action.failure_observation_id
+    WHERE action.recovery_action_id = :recovery_action_id
+  `).get({ ":recovery_action_id": routed.recoveryActionId });
+  assert.deepEqual(stored, {
+    failure_kind: "safety-evidence-xref",
+    action: "abort",
+    recovery_budget_id: null,
+  });
+
+  assert.equal(
+    readTaskRecoveryRoute(attemptId)?.resumeAuthorized,
+    false,
+    "a freshly minted abort has not been resumed",
+  );
+});
+
+test("evidence routing failure surfaces a supported retry instruction", async (t) => {
   const base = makeTempRepo("gsd-evidence-route-rollback-");
   t.after(() => {
     closeDatabase();
@@ -277,4 +358,67 @@ test("evidence routing failure surfaces a supported retry instruction", (t) => {
   });
   assert.match(presentation.exitInstruction, /injected route failure/);
   assert.match(presentation.exitInstruction, /resume with \/gsd auto/);
+
+  // The verdict survived the failed route, so the next dispatch finds a stored
+  // failing verdict with no recovery route and re-routes it itself. It must
+  // recover the originating policy from the verdict's own evidence marker —
+  // otherwise this degraded path silently downgrades the contradiction back to
+  // a budgeted `remediate` and buys the full re-run the dedicated failure kind
+  // exists to prevent.
+  assert.equal(readTaskTechnicalVerdict(attemptId)?.verificationPolicy, "safety-evidence-xref");
+
+  const dispatch = _getAdapter()!.prepare(
+    `SELECT rowid AS id FROM unit_dispatches LIMIT 1`,
+  ).get() as { id: number };
+  const routedInputs: Parameters<typeof recordFailureAndSelectRecovery>[0][] = [];
+  const rerouted = await runWithTaskExecutionAttempt(
+    {
+      unitType: "execute-task",
+      unitId: "M001/S01/T01",
+      dispatchId: dispatch.id,
+      workerId: "evidence-worker",
+      milestoneLeaseToken: 7,
+      traceId: "evidence-trace",
+      turnId: "evidence-turn",
+      markCanonicalDispatchSettled: () => {},
+    },
+    async () => {
+      throw new Error("the stored verdict must be routed before the executor runs");
+    },
+    {
+      readLatestTaskAttempt,
+      readTaskAttempt,
+      readTaskRecoveryRoute,
+      readTaskTechnicalVerdict,
+      claimTaskAttempt: () => {
+        throw new Error("a stored failing verdict must not claim a fresh Attempt");
+      },
+      settleTaskAttempt: () => {
+        throw new Error("a stored failing verdict must not settle a fresh Attempt");
+      },
+      routeTaskFailure: (routeInput) => {
+        routedInputs.push(routeInput);
+        return {
+          status: "committed",
+          operationId: "op-reroute",
+          resultingRevision: 1,
+          lifecycleId: "lifecycle-reroute",
+          attemptId,
+          resultId: attempt!.resultId!,
+          failureObservationId: "observation-reroute",
+          recoveryActionId: "recovery-action-reroute",
+          action: "abort",
+          resumeAuthorized: false,
+        };
+      },
+    },
+  );
+
+  assert.equal(routedInputs.length, 1);
+  assert.equal(routedInputs[0]!.classification.failureKind, "safety-evidence-xref");
+  assert.deepEqual(rerouted, {
+    action: "break",
+    reason:
+      "task-recovery-abort (recoveryActionId: recovery-action-reroute; resume with gsd_task_recovery_resume)",
+  });
 });

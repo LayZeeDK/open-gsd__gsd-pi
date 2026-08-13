@@ -36,6 +36,34 @@ test("agent transient recovery is bounded and never becomes a human pause", () =
   });
 });
 
+test("a safety evidence cross-reference is unbudgeted and aborts on its first occurrence", () => {
+  const classification = { failureKind: "safety-evidence-xref" } as const;
+
+  // No budget is bound, so the decision cannot depend on what the Task's
+  // remediation allowance had left — which is the point: a contradiction
+  // between the verification a Task claimed and the execution the harness
+  // recorded is not clearable by re-running the same Task.
+  for (const budgetUses of [0, 1, 2, 7]) {
+    assert.deepEqual(selectRecoveryDecision({
+      owner: "agent",
+      classification,
+      budgetUses,
+    }), {
+      owner: "agent",
+      action: "abort",
+      budget: null,
+      policyVersion: "task-recovery-v1",
+    });
+  }
+
+  // It must not share a fingerprint with the ordinary verification failure it
+  // used to be filed as, or it would keep drawing on the same budget row.
+  assert.notEqual(
+    normalizeFailureFingerprint(classification),
+    normalizeFailureFingerprint({ failureKind: "verification-failed" }),
+  );
+});
+
 test("agent repair and remediation abort when their fixed budgets are exhausted", () => {
   const repair = { failureKind: "illegal-transition" } as const;
   assert.deepEqual(selectRecoveryDecision({

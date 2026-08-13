@@ -1947,10 +1947,16 @@ export async function postUnitPreVerification(pctx: PostUnitContext, opts?: PreV
                   // Clear the persisted evidence file on the blocked path too, so a
                   // retry cross-references fresh execution instead of replaying the
                   // same stale rows indefinitely (#1641).
-                  try {
-                    clearEvidenceFromDisk(s.basePath, sMid, sSid, sTid);
-                  } catch (clearError) {
-                    debugLog("postUnit", { phase: "safety-evidence-clear", error: String(clearError) });
+                  //
+                  // Not when the route is a terminal abort: there is no retry to keep
+                  // clean, and the recorded execution is the operator's only proof of
+                  // the contradiction they are being asked to repair before resuming.
+                  if (routed?.outcome !== "abort") {
+                    try {
+                      clearEvidenceFromDisk(s.basePath, sMid, sSid, sTid);
+                    } catch (clearError) {
+                      debugLog("postUnit", { phase: "safety-evidence-clear", error: String(clearError) });
+                    }
                   }
                   const mismatchDetail =
                     `"${blockingMismatch.claimed.command.slice(0, 80)}" — ${blockingMismatch.reason}`;

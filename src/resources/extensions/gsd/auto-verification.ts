@@ -67,6 +67,7 @@ import {
   invalidateTaskTechnicalPass,
   readTaskTechnicalVerdict,
   recordTaskTechnicalVerdict,
+  storedVerdictFailureKind,
   type InvalidateTaskTechnicalPassInput,
   type RecordTaskTechnicalVerdictInput,
   type TaskTechnicalVerdictReceipt,
@@ -244,7 +245,8 @@ function routeHostTechnicalFailure(
   authority: TaskVerificationAuthority,
   attempt: VerificationAttemptSnapshot,
   verdict: FailedVerdictIdentity,
-  failureKind: "verification-failed" | "verification-drift" = "verification-failed",
+  failureKind: "verification-failed" | "verification-drift" | "safety-evidence-xref" =
+    "verification-failed",
   // A terminal abort is resumable by design via `gsd_task_recovery_resume`, but that
   // tool needs the exact recoveryActionId. Hand it back so the caller can surface it
   // on the finalize break reason instead of discarding it here (#1593).
@@ -263,7 +265,9 @@ function routeHostTechnicalFailure(
     classification: { failureKind },
     summary: failureKind === "verification-drift"
       ? "Stored host verification pass no longer matches the current source"
-      : "Built-in host verification did not pass",
+      : failureKind === "safety-evidence-xref"
+        ? "Recorded execution contradicts the verification the Task claimed"
+        : "Built-in host verification did not pass",
     evidence: {
       verdictId: verdict.verdictId,
       evidenceId: verdict.evidenceId,
@@ -320,9 +324,18 @@ export interface EvidenceCrossReferenceBlockResult {
  * This records the withheld verdict as a durable failing host Technical
  * Verdict (which advances the kernel checkpoint to the route stage, ending the
  * awaiting-verification wedge) and routes the failure through the same durable
- * recovery policy the verification gate uses — same idempotency key, same
- * classification — so any later gate pass over this Attempt replays rather
- * than conflicts.
+ * recovery policy the verification gate uses, so any later gate pass over this
+ * Attempt replays rather than conflicts.
+ *
+ * That replay depends on the classification too, not just the key. The route
+ * key is `internal:auto:attempt.route:<resultId>` regardless of failure kind,
+ * and the domain layer hashes the whole request, so a later pass that re-routes
+ * this verdict under a DIFFERENT `failureKind` raises an idempotency conflict
+ * rather than replaying. The classification here is `safety-evidence-xref`
+ * (unbudgeted, terminal — see `recovery-policy.ts`), so every site that
+ * re-routes a stored verdict must recover it from the verdict's evidence marker
+ * via `storedVerdictFailureKind`. Adding a re-route site without that is a
+ * thrown conflict in the verification gate, not a graceful replay.
  */
 export function routeEvidenceCrossReferenceBlock(input: {
   attempt: VerificationAttemptSnapshot;
@@ -371,7 +384,13 @@ export function routeEvidenceCrossReferenceBlock(input: {
     authority,
     attempt,
     { verdictId: recorded.verdictId, evidenceId: recorded.evidenceId, verdict: "fail" },
-    "verification-failed",
+    // Not `verification-failed`: that kind carries a budgeted `remediate` rule
+    // whose uses are counted per Task lifecycle, so an evidence contradiction
+    // shared its budget with every ordinary host verification failure on the
+    // same Task and spent one or two full re-runs before reaching a resumable
+    // abort. The dedicated kind is unbudgeted, so this aborts on the first
+    // contradiction, deterministically.
+    "safety-evidence-xref",
     undefined,
     (recoveryActionId, action) => {
       routed = { recoveryActionId, action };
@@ -776,7 +795,10 @@ export async function runPostUnitVerification(
         verdictId: replayedVerdict.verdictId,
         evidenceId: replayedVerdict.evidenceId,
         verdict: replayedVerdict.verdict,
-      }, replayedVerdict.supersedesVerdictId ? "verification-drift" : "verification-failed", recordAbort)
+      }, storedVerdictFailureKind(
+        replayedVerdict,
+        replayedVerdict.supersedesVerdictId ? "verification-drift" : "verification-failed",
+      ), recordAbort)
       : null;
     if (!replayedRecovery && !isTaskAttemptAwaitingVerification(latestAttempt)) {
       throw new Error("Host verification requires the latest succeeded canonical Attempt at the verify stage");
@@ -1360,7 +1382,10 @@ export async function runPostUnitVerification(
         verdictId: storedVerdict.verdictId,
         evidenceId: storedVerdict.evidenceId,
         verdict: storedVerdict.verdict,
-      }, storedVerdict.supersedesVerdictId ? "verification-drift" : "verification-failed", recordAbort);
+      }, storedVerdictFailureKind(
+        storedVerdict,
+        storedVerdict.supersedesVerdictId ? "verification-drift" : "verification-failed",
+      ), recordAbort);
       if (recovery === "abort") return "abort";
       const retryKey = verificationRetryKey(s.currentUnit.type, s.currentUnit.id);
       return recordDurableVerificationRetry(s, retryKey, message);
