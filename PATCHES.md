@@ -53,6 +53,7 @@ Full build, link and rebase procedure: **[FORK.md](FORK.md)**.
 | 18 | `21209a67` | first-strike abort for evidence cross-reference contradictions | not filed |
 | 19 | `9afe19e5` | per-condition diagnosis for a refused recovery resume | not filed |
 | 20 | `82cf0f1f` | relaunch resumes a standing task recovery abort | not filed |
+| 21 | `db9d2b2f` | a corrected re-run supersedes the failure it replaced | not filed |
 
 Patch 8 spans **two** commits: `d44f1275` (`test(mcp-server): pin elicitation
 behaviour across client capability shapes`) lands `elicitation-capability.test.ts`
