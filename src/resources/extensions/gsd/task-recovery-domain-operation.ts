@@ -10,6 +10,7 @@ import {
   type DomainOperationRequest,
   type DomainOperationResult,
 } from "./db/domain-operation.js";
+import { debugLog } from "./debug-logger.js";
 import { getDb } from "./db/engine.js";
 import {
   CURRENT_EVIDENCE_BACKED_FAILURE_VERDICT_SQL,
@@ -599,6 +600,150 @@ function loadTaskRecoveryReceipt(
   };
 }
 
+const RESUME_REFUSAL_PREFIX = "Task recovery resume requires the current agent-owned abort";
+
+function describeSqlText(value: unknown): string {
+  return typeof value === "string" && value.length > 0 ? value : "unknown";
+}
+
+/** One row of the resume-refusal diagnostic, or `undefined` when the id is unknown. */
+export type ResumeRefusalRow = Record<string, unknown> | undefined;
+
+/**
+ * Choose which condition to blame for a refused resume.
+ *
+ * Split from the query so every branch is reachable from a unit test with a
+ * plain object. Several of these conditions are not producible through the
+ * domain writers today — `recordFailureObservation` is the only production
+ * writer of `workflow_failure_observations` and always supplies an Attempt and
+ * Result — so a DB-backed test could only reach them by hand-inserting states
+ * the domain refuses to create. This keeps them honestly covered instead.
+ *
+ * Ordered from "this id is meaningless" outward to "this id was valid and is
+ * spent", and stops at the first failure. Where more than one condition holds
+ * the earlier one is the more actionable: "superseded" points at the current
+ * Attempt, which is what a caller holding a stale id needs.
+ */
+export function describeResumeRefusal(row: ResumeRefusalRow, recoveryActionId: string): string {
+  if (!row) return "no recovery action with that id exists";
+  if (row["action_value"] !== "abort") {
+    return `recovery action ${recoveryActionId} routed '${describeSqlText(row["action_value"])}', not 'abort'`;
+  }
+  if (row["blocker_id"] !== null && row["blocker_id"] !== undefined) {
+    return "the abort is human-owned (it carries a blocker)";
+  }
+  if (row["observation_id"] === null || row["observation_id"] === undefined) {
+    return "the abort has no failure observation to resume from";
+  }
+  if (row["owner_value"] !== "agent") {
+    return `the abort is owned by '${describeSqlText(row["owner_value"])}', not the agent`;
+  }
+  if (row["lifecycle_value"] !== "in_progress") {
+    return `the Task lifecycle is '${describeSqlText(row["lifecycle_value"])}', not 'in_progress'`;
+  }
+  // Checked before the Attempt state, so a missing Attempt is never reported as
+  // a wrong Attempt state — and so the attempt-number comparison below can
+  // never be a `null !== null` no-op.
+  if (row["attempt_number"] === null || row["attempt_number"] === undefined) {
+    return "the observation records no Attempt to resume";
+  }
+  if (row["attempt_state_value"] !== "settled") {
+    return `the Attempt is '${describeSqlText(row["attempt_state_value"])}', not 'settled'`;
+  }
+  if (row["attempt_number"] !== row["max_attempt_number"]) {
+    return `superseded: Attempt ${String(row["attempt_number"])} is not the current Attempt ${String(row["max_attempt_number"] ?? "unknown")}`;
+  }
+  if (row["result_id"] === null || row["result_id"] === undefined) {
+    return "the observation records no Attempt Result to resume from";
+  }
+  if (row["causal_authority_ok"] !== 1) {
+    return "the routed Result is no longer the current evidence-backed failure";
+  }
+  if (row["has_open_blocker"] === 1) {
+    return "an open blocker on the Task must be resolved first";
+  }
+  if (row["already_resumed"] === 1) return "already resumed";
+  // Reachable: the causal-authority fragment folds a two-branch evidence-verdict
+  // test into one column, and any condition added to the gate later lands here
+  // by default. Never leave the suffix undefined.
+  return "the eligibility query refused it for a condition this diagnosis does not cover";
+}
+
+/**
+ * Explain which of the eligibility gate's conditions refused a resume.
+ *
+ * The gate in `requireResumableAbortScope` ANDs nine conditions into one query
+ * and is deliberately left as the single authority — splitting it into
+ * sequential checks would duplicate its joins and let the diagnosis drift from
+ * the decision. This runs only after that gate has already refused, purely to
+ * name the reason.
+ *
+ * It must NOT reuse the gate's joins. The gate reaches its predicates through
+ * four INNER JOINs, so a diagnostic built the same way returns no row whenever
+ * any joined row is missing and would then report "no such id" for an id that
+ * plainly exists. Anchor on the action, LEFT JOIN everything else, and read
+ * NULL-propagating comparisons as failures.
+ *
+ * The lifecycle is reached through the OBSERVATION, not through the Attempt.
+ * `workflow_failure_observations.attempt_id` is nullable outside the `execute`
+ * boundary stage, and joining the lifecycle through a NULL Attempt would report
+ * a missing Attempt as a wrong lifecycle status — the exact misdirection the
+ * LEFT JOINs exist to avoid.
+ */
+function diagnoseResumeRefusal(recoveryActionId: string): string {
+  const stored = getDb().prepare(`
+    SELECT action.action AS action_value,
+           action.blocker_id AS blocker_id,
+           observation.failure_observation_id AS observation_id,
+           observation.result_id AS result_id,
+           observation.recovery_owner AS owner_value,
+           lifecycle.lifecycle_status AS lifecycle_value,
+           attempt.attempt_state AS attempt_state_value,
+           attempt.attempt_number AS attempt_number,
+           (
+             SELECT MAX(latest.attempt_number)
+             FROM workflow_execution_attempts latest
+             WHERE latest.project_id = attempt.project_id
+               AND latest.lifecycle_id = attempt.lifecycle_id
+           ) AS max_attempt_number,
+           CASE WHEN ${CURRENT_TASK_RECOVERY_CAUSAL_AUTHORITY_SQL} THEN 1 ELSE 0 END
+             AS causal_authority_ok,
+           CASE WHEN EXISTS (
+             SELECT 1 FROM workflow_blockers blocker
+             WHERE blocker.project_id = action.project_id
+               AND blocker.lifecycle_id = action.lifecycle_id
+               AND blocker.blocker_status = 'open'
+           ) THEN 1 ELSE 0 END AS has_open_blocker,
+           CASE WHEN EXISTS (
+             SELECT 1 FROM workflow_domain_events resumed
+             WHERE resumed.project_id = action.project_id
+               AND resumed.event_type = 'task.recovery.resumed'
+               AND json_extract(resumed.payload_json, '$.recoveryActionId')
+                     = action.recovery_action_id
+           ) THEN 1 ELSE 0 END AS already_resumed
+    FROM workflow_recovery_actions action
+    LEFT JOIN workflow_failure_observations observation
+      ON observation.project_id = action.project_id
+     AND observation.lifecycle_id = action.lifecycle_id
+     AND observation.failure_observation_id = action.failure_observation_id
+    LEFT JOIN workflow_execution_attempts attempt
+      ON attempt.project_id = observation.project_id
+     AND attempt.lifecycle_id = observation.lifecycle_id
+     AND attempt.attempt_id = observation.attempt_id
+    LEFT JOIN workflow_attempt_results result
+      ON result.project_id = observation.project_id
+     AND result.lifecycle_id = observation.lifecycle_id
+     AND result.attempt_id = observation.attempt_id
+     AND result.result_id = observation.result_id
+    LEFT JOIN workflow_item_lifecycles lifecycle
+      ON lifecycle.project_id = action.project_id
+     AND lifecycle.lifecycle_id = action.lifecycle_id
+    WHERE action.recovery_action_id = :recovery_action_id
+  `).get({ ":recovery_action_id": recoveryActionId }) as ResumeRefusalRow;
+
+  return describeResumeRefusal(stored, recoveryActionId);
+}
+
 function requireResumableAbortScope(recoveryActionId: string): FailedAttemptScope {
   const stored = getDb().prepare(`
     SELECT observation.attempt_id, observation.result_id
@@ -645,7 +790,25 @@ function requireResumableAbortScope(recoveryActionId: string): FailedAttemptScop
           AND json_extract(resumed.payload_json, '$.recoveryActionId') = action.recovery_action_id
       )
   `).get({ ":recovery_action_id": recoveryActionId }) as Record<string, unknown> | undefined;
-  if (!stored) throw new Error("Task recovery resume requires the current agent-owned abort");
+  if (!stored) {
+    let diagnosis: string;
+    try {
+      diagnosis = diagnoseResumeRefusal(recoveryActionId);
+    } catch (error) {
+      // Never mask a refusal with a second error — the caller asked why the
+      // resume was refused, not why the explanation failed. But do NOT discard
+      // the explanation's own failure: falling back silently reproduces exactly
+      // the reason-less message this diagnosis exists to replace, and leaves an
+      // operator with a dead end. Log it, then fall back.
+      debugLog("taskRecovery", {
+        phase: "resume-refusal-diagnosis-failed",
+        recoveryActionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      throw new Error(RESUME_REFUSAL_PREFIX);
+    }
+    throw new Error(`${RESUME_REFUSAL_PREFIX}: ${diagnosis}`);
+  }
   return loadRoutedFailureScope(String(stored["attempt_id"]), String(stored["result_id"]));
 }
 
