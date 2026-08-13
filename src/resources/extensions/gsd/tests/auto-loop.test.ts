@@ -31,6 +31,7 @@ import { runUnitPhase, resetSessionTimeoutState } from "../auto/unit-phase.js";
 import { runPostUnitVerification } from "../auto-verification.js";
 import type { UnitResult, AgentEndEvent, LoopState } from "../auto/types.js";
 import type { LoopDeps } from "../auto/loop-deps.js";
+import type { StandingAbortResolution } from "../auto/task-recovery-relaunch.js";
 import type { AutoAdvanceResult, AutoOrchestrationModule, AutoStatus, UnitRef } from "../auto/contracts.js";
 import { WorktreeStateProjection } from "../worktree-state-projection.js";
 import { ModelPolicyDispatchBlockedError } from "../auto-model-selection.js";
@@ -2284,6 +2285,272 @@ test("custom-engine recovery break and retry terminalize their dispatch", async 
       closeDatabase();
       rmSync(basePath, { recursive: true, force: true });
     }
+  }
+});
+
+// Scenario matrix for the standing task-recovery-abort relaunch.
+//
+// Shared by two tests because the loop has TWO break sites that must behave
+// identically: the custom-engine one and the default one. The default site was a
+// hand-duplicated copy with no coverage at all — deleting it left every test
+// green, which three independent reviews each demonstrated. They cannot live in
+// one test because the custom-engine cases mock `CustomWorkflowEngine.prototype`,
+// and those mocks are test-scoped, so the default path never reaches dispatch
+// while they are installed.
+const STANDING_ABORT_SCENARIOS: Array<{
+  name: string;
+  standing: boolean;
+  resolution: StandingAbortResolution;
+  reason: string;
+  expectDispatches: number;
+  expectResumeCalls: number;
+  expectNotify: RegExp | null;
+}> = [
+  {
+    name: "resumed",
+    // A STANDING abort: the pre-dispatch gate refused before any work ran, so an
+    // operator relaunch is what re-entered it.
+    standing: true,
+    resolution: { status: "resumed", recoveryActionId: "r-1" },
+    reason: "task-recovery-abort (recoveryActionId: r-1)",
+    expectDispatches: 2,
+    expectResumeCalls: 1,
+    expectNotify: /Resumed the standing task recovery abort for M001\/S01\/T01/,
+  },
+  {
+    name: "exhausted",
+    standing: true,
+    resolution: { status: "exhausted", recoveryActionId: "r-1" },
+    reason: "task-recovery-abort (recoveryActionId: r-1)",
+    expectDispatches: 1,
+    expectResumeCalls: 1,
+    expectNotify: /automatic relaunch resume for this failure has already been used/i,
+  },
+  {
+    name: "refused",
+    standing: true,
+    resolution: {
+      status: "refused",
+      recoveryActionId: "r-1",
+      reason: "Task recovery resume requires the current agent-owned abort: already resumed",
+    },
+    reason: "task-recovery-abort (recoveryActionId: r-1)",
+    expectDispatches: 1,
+    expectResumeCalls: 1,
+    // The refusal must reach the operator, not only debugLog — it carries the
+    // per-condition diagnosis the companion patch exists to produce.
+    expectNotify:
+      /refused: Task recovery resume requires the current agent-owned abort: already resumed/,
+  },
+  {
+    // An abort minted by the run that just executed. No operator authorized it,
+    // so it must never be auto-resumed — that would buy back exactly the
+    // unattended paid re-run the evidence cross-reference patch removed.
+    name: "freshly-minted",
+    standing: false,
+    resolution: { status: "resumed", recoveryActionId: "r-1" },
+    reason: "task-recovery-abort (recoveryActionId: r-1)",
+    expectDispatches: 1,
+    expectResumeCalls: 0,
+    expectNotify: /Task recovery requires a verified repair/,
+  },
+  {
+    // The scope guard. Every other break reason must be untouched.
+    name: "unrelated-break-reason",
+    standing: true,
+    resolution: { status: "resumed", recoveryActionId: "r-1" },
+    reason: "provider-pause",
+    expectDispatches: 1,
+    expectResumeCalls: 0,
+    expectNotify: null,
+  },
+];
+
+function assertStandingAbortOutcome(
+  label: string,
+  scenario: (typeof STANDING_ABORT_SCENARIOS)[number],
+  observed: {
+    dispatches: number;
+    resumeCalls: number;
+    pauseAtDispatch: number | null;
+    notifications: string[];
+  },
+): void {
+  assert.equal(observed.dispatches, scenario.expectDispatches, `${label}: dispatch count`);
+  assert.equal(observed.resumeCalls, scenario.expectResumeCalls, `${label}: resume attempts`);
+  if (scenario.expectNotify) {
+    assert.match(observed.notifications.join("\n"), scenario.expectNotify, `${label}: notification`);
+  }
+  if (scenario.name === "resumed") {
+    assert.equal(observed.pauseAtDispatch, 2, `${label}: the resumed iteration must not pause`);
+  } else if (scenario.reason.startsWith("task-recovery-abort")) {
+    assert.equal(observed.pauseAtDispatch, 1, `${label}: must pause without re-dispatching`);
+  } else {
+    assert.equal(observed.pauseAtDispatch, null, `${label}: an unrelated break must not pause here`);
+  }
+}
+
+/** Wire the injected resolver and count what the loop actually did. */
+function standingAbortDeps(
+  s: ReturnType<typeof makeLoopSession>,
+  scenario: (typeof STANDING_ABORT_SCENARIOS)[number],
+  observed: {
+    dispatches: number;
+    resumeCalls: number;
+    pauseAtDispatch: number | null;
+    notifications: string[];
+  },
+  extra: Record<string, unknown> = {},
+) {
+  return makeMockDeps({
+    ...extra,
+    taskExecutionBoundary: async () => {
+      observed.dispatches++;
+      // Bound the resumed case only. Every other case must terminate through
+      // pauseAuto, so `dispatches === 1` is a real assertion rather than an
+      // artefact of stopping the loop here.
+      if (observed.dispatches >= 2) s.active = false;
+      return {
+        action: "break",
+        reason: scenario.reason,
+        ...(scenario.standing ? { standingRecoveryActionId: "r-1" } : {}),
+      };
+    },
+    resumeStandingTaskRecoveryAbort: () => {
+      observed.resumeCalls++;
+      return scenario.resolution;
+    },
+    pauseAuto: async () => {
+      observed.pauseAtDispatch ??= observed.dispatches;
+      s.active = false;
+    },
+  });
+}
+
+test("a standing recovery abort re-dispatches on the custom-engine break site", async (t) => {
+  t.mock.method(CustomWorkflowEngine.prototype, "deriveState", async () => ({
+    phase: "executing",
+    isComplete: false,
+    readySteps: [],
+    blockedSteps: [],
+    completedSteps: [],
+  }) as any);
+  t.mock.method(CustomWorkflowEngine.prototype, "resolveDispatch", async () => ({
+    action: "dispatch",
+    step: {
+      unitType: "execute-task",
+      unitId: "M001/S01/T01",
+      prompt: "execute the Task",
+    },
+  }) as any);
+
+  for (const scenario of STANDING_ABORT_SCENARIOS) {
+    _resetPendingResolve();
+    const basePath = realpathSync(makeLoopTestBase(`gsd-relaunch-custom-${scenario.name}-`));
+    mkdirSync(join(basePath, ".gsd"), { recursive: true });
+    try {
+      openDatabase(join(basePath, ".gsd", "gsd.db"));
+      insertMilestone({ id: "M001", title: "Test Milestone", status: "active" });
+      insertSlice({ id: "S01", milestoneId: "M001", title: "Test Slice", status: "active" });
+      insertTask({ id: "T01", milestoneId: "M001", sliceId: "S01", title: "Task One", status: "pending" });
+      const workerId = registerAutoWorker({ projectRootRealpath: basePath });
+      const lease = claimMilestoneLease(workerId, "M001");
+      assert.equal(lease.ok, true);
+      if (!lease.ok) return;
+
+      const ctx = makeMockCtx();
+      ctx.ui.setStatus = () => {};
+      ctx.ui.setWidget = () => {};
+      const observed = {
+        dispatches: 0,
+        resumeCalls: 0,
+        pauseAtDispatch: null as number | null,
+        notifications: [] as string[],
+      };
+      ctx.ui.notify = (msg: string) => observed.notifications.push(msg);
+      const s = makeLoopSession({
+        activeEngineId: "custom",
+        activeRunDir: basePath,
+        basePath,
+        originalBasePath: basePath,
+        canonicalProjectRoot: basePath,
+        workerId,
+        milestoneLeaseToken: lease.token,
+      });
+
+      await rawAutoLoop(
+        ctx,
+        makeMockPi(),
+        s,
+        standingAbortDeps(s, scenario, observed, { isDbAvailable: () => true }),
+      );
+
+      assertStandingAbortOutcome(`custom/${scenario.name}`, scenario, observed);
+    } finally {
+      closeDatabase();
+      rmSync(basePath, { recursive: true, force: true });
+    }
+  }
+});
+
+test("a resumed standing abort releases the unit in the orchestrator before re-dispatching", async () => {
+  _resetPendingResolve();
+  const ctx = makeMockCtx();
+  ctx.ui.setStatus = () => {};
+  ctx.ui.setWidget = () => {};
+  const observed = {
+    dispatches: 0,
+    resumeCalls: 0,
+    pauseAtDispatch: null as number | null,
+    notifications: [] as string[],
+  };
+  ctx.ui.notify = (msg: string) => observed.notifications.push(msg);
+  const s = makeLoopSession();
+  const pi = makeMockPi();
+  const deps = standingAbortDeps(s, STANDING_ABORT_SCENARIOS[0]!, observed);
+
+  // Wrap the real test orchestration so the release is observable. Asserting
+  // the re-dispatch alone is NOT enough: the mock orchestration does not model
+  // the `lastAdvanceKey` idempotency guard, so a loop that never released the
+  // unit still re-dispatches here — while the real orchestrator answers
+  // "idempotent advance: unit already active" and trips the ADR-047 wedge.
+  s.orchestration = createLoopTestOrchestration(ctx, pi, s, deps);
+  const realRetry = s.orchestration.retryActiveUnit.bind(s.orchestration);
+  const released: string[] = [];
+  s.orchestration.retryActiveUnit = async (unit: { unitType: string; unitId: string }) => {
+    released.push(`${unit.unitType} ${unit.unitId}`);
+    await realRetry(unit);
+  };
+
+  await autoLoop(ctx, pi, s, deps);
+
+  assert.deepEqual(
+    released,
+    ["execute-task M001/S01/T01"],
+    "the resumed iteration must release the active unit, as the finalize-retry path does",
+  );
+});
+
+test("a standing recovery abort re-dispatches on the default break site", async () => {
+  for (const scenario of STANDING_ABORT_SCENARIOS) {
+    _resetPendingResolve();
+    const ctx = makeMockCtx();
+    ctx.ui.setStatus = () => {};
+    ctx.ui.setWidget = () => {};
+    const observed = {
+      dispatches: 0,
+      resumeCalls: 0,
+      pauseAtDispatch: null as number | null,
+      notifications: [] as string[],
+    };
+    ctx.ui.notify = (msg: string) => observed.notifications.push(msg);
+    const s = makeLoopSession();
+
+    // `autoLoop` (the local wrapper) installs `s.orchestration`, which the
+    // default dispatch path needs to claim a dispatch at all.
+    await autoLoop(ctx, makeMockPi(), s, standingAbortDeps(s, scenario, observed));
+
+    assertStandingAbortOutcome(`default/${scenario.name}`, scenario, observed);
   }
 });
 

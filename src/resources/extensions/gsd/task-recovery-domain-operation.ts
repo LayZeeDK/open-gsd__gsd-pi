@@ -875,6 +875,76 @@ export function resumeTaskRecovery(input: {
   return loadTaskRecoveryResumeReceipt(operation);
 }
 
+/**
+ * Marker stamped on the repair evidence of a resume that was authorized by an
+ * operator relaunching GSD, rather than by an operator attesting a repair.
+ *
+ * It exists so the two are distinguishable forever in
+ * `workflow_domain_events`, and so the relaunch budget can count only its own.
+ */
+export const AUTO_RELAUNCH_RESUME_AUTHORIZATION = "auto-relaunch" as const;
+
+/**
+ * True when an auto-relaunch resume has already been spent on this recovery
+ * action's lifecycle for the same failure kind.
+ *
+ * Keyed on (lifecycle, failure kind) rather than on the recoveryActionId,
+ * because a recurring failure mints a NEW action id every time — bounding per
+ * id would not bound anything, and the loop it fails to stop costs a full paid
+ * task run per cycle.
+ *
+ * Operator-attested resumes carry no marker, so they neither consume this
+ * budget nor are blocked by it.
+ *
+ * The marker alone is NOT trusted. `gsd_task_recovery_resume` takes `evidence`
+ * as a free-form object, so any MCP caller — including the executing agent the
+ * abort is constraining — could stamp `authorization: "auto-relaunch"` to forge
+ * the audit trail or to burn the budget and keep the Task wedged. The operation
+ * behind the event must therefore also be `internal`, which the domain layer
+ * sets from the invocation and the MCP surface cannot claim: every MCP
+ * invocation is built server-side with `sourceTransport: "workflow-mcp"`.
+ */
+export function hasSpentAutoRelaunchResume(recoveryActionId: string): boolean {
+  const stored = getDb().prepare(`
+    SELECT EXISTS (
+      SELECT 1
+      FROM workflow_domain_events event
+      JOIN workflow_operations prior_operation
+        ON prior_operation.project_id = event.project_id
+       AND prior_operation.operation_id = event.operation_id
+      JOIN workflow_recovery_actions prior_action
+        ON prior_action.project_id = event.project_id
+       AND prior_action.recovery_action_id =
+             json_extract(event.payload_json, '$.recoveryActionId')
+      JOIN workflow_failure_observations prior_observation
+        ON prior_observation.project_id = prior_action.project_id
+       AND prior_observation.lifecycle_id = prior_action.lifecycle_id
+       AND prior_observation.failure_observation_id =
+             prior_action.failure_observation_id
+      WHERE event.event_type = 'task.recovery.resumed'
+        AND prior_operation.source_transport = 'internal'
+        AND json_extract(event.payload_json, '$.evidence.authorization')
+              = :authorization
+        AND prior_observation.lifecycle_id = observation.lifecycle_id
+        AND prior_observation.failure_kind = observation.failure_kind
+    ) AS spent
+    FROM workflow_recovery_actions action
+    JOIN workflow_failure_observations observation
+      ON observation.project_id = action.project_id
+     AND observation.lifecycle_id = action.lifecycle_id
+     AND observation.failure_observation_id = action.failure_observation_id
+    WHERE action.recovery_action_id = :recovery_action_id
+  `).get({
+    ":recovery_action_id": recoveryActionId,
+    ":authorization": AUTO_RELAUNCH_RESUME_AUTHORIZATION,
+  }) as Record<string, unknown> | undefined;
+  // Callers only reach here with an id they just read from a live route, and
+  // the action -> observation join is FK-backed, so a row always comes back.
+  // The real fail-closed for an unreadable state is the caller's catch; this
+  // default only keeps an impossible read from resuming.
+  return stored ? Number(stored["spent"]) === 1 : true;
+}
+
 export function readTaskRecoveryRoute(attemptId: string): TaskRecoveryRouteSnapshot | null {
   const stored = getDb().prepare(`
     SELECT action.recovery_action_id, action.action,

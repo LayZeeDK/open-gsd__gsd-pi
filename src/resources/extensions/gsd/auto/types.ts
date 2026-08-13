@@ -76,7 +76,20 @@ export interface UnitResult {
 
 export type PhaseResult<T = void> =
   | { action: "continue" }
-  | { action: "break"; reason: string; inputPayload?: string }
+  | {
+      action: "break";
+      reason: string;
+      inputPayload?: string;
+      /**
+       * Set only when the break is a STANDING Task recovery abort — one that
+       * blocked the dispatch before any work ran, so the operator's relaunch is
+       * what re-entered it. Carried out of band rather than in `reason` because
+       * `reason` feeds the ADR-047 block signature and the dispatch ledger, and
+       * because an abort minted by the run that just happened must never be
+       * mistaken for one the operator relaunched into.
+       */
+      standingRecoveryActionId?: string;
+    }
   | { action: "retry"; reason: string; data?: T }
   | { action: "next"; data: T }
 

@@ -1143,9 +1143,14 @@ test("an unresumed verification abort stops before a replacement claim", async (
     },
   });
 
+  // The pre-dispatch gate is the only STANDING abort: it refused before `run()`
+  // was called, so an operator relaunch is what re-entered it. The marker is
+  // what lets the auto loop tell this apart from an abort minted by a run that
+  // just executed, which must never be auto-resumed.
   assert.deepEqual(result, {
     action: "break",
     reason: TASK_RECOVERY_ABORT_REASON,
+    standingRecoveryActionId: "recovery-action-1",
   });
   assert.equal(ran, false);
   assert.equal(domain.claims.length, 0);

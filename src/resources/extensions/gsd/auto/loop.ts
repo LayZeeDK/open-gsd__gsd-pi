@@ -105,6 +105,7 @@ import {
   createExecutionGraphUnitDispatchDeps,
   runUnitPhaseViaContract,
   type DispatchContract,
+  type UnitPhaseResult,
 } from "./workflow-unit-dispatch.js";
 import { handleCustomEngineDispatchOutcome } from "./workflow-custom-engine-dispatch-outcome.js";
 import { buildCustomEngineIterationData } from "./workflow-custom-engine-iteration.js";
@@ -126,6 +127,10 @@ import {
   publishVerifiedTaskExecution,
   runWithTaskExecutionAttempt,
 } from "./task-execution-cutover.js";
+import {
+  resumeStandingTaskRecoveryAbort,
+  type StandingAbortResolution,
+} from "./task-recovery-relaunch.js";
 import {
   requestCustomTaskHumanReviewFromUi,
   resolvePendingCustomTaskHumanReview,
@@ -495,16 +500,76 @@ export async function autoLoop(
       ...details,
     }),
   };
-  const pauseForTaskRecoveryAbort = async (reason: string): Promise<void> => {
-    if (!reason.startsWith("task-recovery-abort")) return;
+  /**
+   * A standing agent-owned abort breaks every dispatch before any work starts,
+   * so without this the relaunch the operator just performed is wasted and the
+   * project stays wedged forever. Resume it once per (lifecycle, failure kind)
+   * and let the loop re-dispatch; see `task-recovery-relaunch.ts` for why that
+   * is the only in-band lever and why the cap is load-bearing.
+   *
+   * Returns "resumed" when the caller should continue the loop instead of
+   * stopping. Every other break reason keeps today's behaviour exactly.
+   */
+  // One automatic relaunch resume per `autoLoop` run. The durable budget is
+  // keyed on (lifecycle, failure kind), and `TaskFailureKind` is a 19-member
+  // union over free TEXT — so without this an unattended run could walk a
+  // flapping Task through one paid re-dispatch per failure kind. The operator
+  // authorized ONE relaunch; spend at most one resume on it.
+  let autoRelaunchResumes = 0;
+
+  const resolveTaskRecoveryAbort = async (
+    result: Extract<UnitPhaseResult, { action: "break" }>,
+    unit: { unitType: string; unitId: string },
+  ): Promise<"resumed" | "stopped"> => {
+    const reason = result.reason;
+    if (!reason.startsWith("task-recovery-abort")) return "stopped";
+    // Only a STANDING abort is authorized by the relaunch. An abort minted by
+    // the run that just executed has no operator behind it, and resuming it
+    // would buy back exactly the unattended paid re-run the evidence-xref
+    // patch removed.
+    const standingRecoveryActionId = result.standingRecoveryActionId;
+    let resolution: StandingAbortResolution = { status: "not-applicable" };
+    if (standingRecoveryActionId && autoRelaunchResumes === 0) {
+      const resolve = deps.resumeStandingTaskRecoveryAbort ?? resumeStandingTaskRecoveryAbort;
+      try {
+        resolution = resolve(unit.unitType, unit.unitId);
+      } catch (err) {
+        debugLog("autoLoop", {
+          phase: "task-recovery-relaunch-failed",
+          unitId: unit.unitId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        resolution = { status: "not-applicable" };
+      }
+    }
+    if (
+      resolution.status === "resumed" &&
+      resolution.recoveryActionId === standingRecoveryActionId
+    ) {
+      autoRelaunchResumes++;
+      ctx.ui.notify(
+        `Resumed the standing task recovery abort for ${unit.unitId} ` +
+          `(recoveryActionId: ${resolution.recoveryActionId}). Re-dispatching.`,
+        "warning",
+      );
+      return "resumed";
+    }
+    let detail = "";
+    if (resolution.status === "exhausted") {
+      detail = " The automatic relaunch resume for this failure has already been used — " +
+        "supply real repair evidence with gsd_task_recovery_resume.";
+    } else if (resolution.status === "refused") {
+      detail = ` The automatic relaunch resume was refused: ${resolution.reason}`;
+    }
     ctx.ui.notify(
-      `Task recovery requires a verified repair before auto-mode can continue. ${reason}`,
+      `Task recovery requires a verified repair before auto-mode can continue. ${reason}${detail}`,
       "warning",
     );
     await deps.pauseAuto(ctx, pi, {
       message: reason,
       category: "unknown",
     });
+    return "stopped";
   };
 
   while (s.active) {
@@ -938,7 +1003,28 @@ export async function autoLoop(
           if (customDispatchId !== null && !customDispatchSettled) {
             throw new Error(`Could not terminalize custom-engine dispatch ${customDispatchId} after unit break`);
           }
-          await pauseForTaskRecoveryAbort(breakReason);
+          if (await resolveTaskRecoveryAbort(unitPhaseResult, iterData) === "resumed") {
+            // Release the unit in the orchestrator before re-dispatching, the
+            // same way the finalize-retry path does. Without this the next
+            // advance still matches `lastAdvanceKey` and returns "idempotent
+            // advance: unit already active" with nothing in flight, which is
+            // `orchestration-stale-active-unit` — two of those trip the ADR-047
+            // wedge and the relaunch that was meant to unstick the project
+            // wedges it a different way instead.
+            await s.orchestration?.retryActiveUnit({
+              unitType: iterData.unitType,
+              unitId: iterData.unitId,
+            });
+            finishIncompleteIteration({
+              status: "retry",
+              reason: breakReason,
+              retry: true,
+              unitType: iterData.unitType,
+              unitId: iterData.unitId,
+            });
+            finishTurn("retry", "execution", breakReason, "unit-retry");
+            continue;
+          }
           finishIncompleteIteration({
             status: "stopped",
             reason: breakReason,
@@ -1723,7 +1809,28 @@ export async function autoLoop(
             markFailed: markDispatchFailed,
             logWriteFailure: logDispatchLedgerWriteFailure,
           }));
-        await pauseForTaskRecoveryAbort(breakReason);
+        if (await resolveTaskRecoveryAbort(unitPhaseResult, iterData) === "resumed") {
+            // Release the unit in the orchestrator before re-dispatching, the
+            // same way the finalize-retry path does. Without this the next
+            // advance still matches `lastAdvanceKey` and returns "idempotent
+            // advance: unit already active" with nothing in flight, which is
+            // `orchestration-stale-active-unit` — two of those trip the ADR-047
+            // wedge and the relaunch that was meant to unstick the project
+            // wedges it a different way instead.
+            await s.orchestration?.retryActiveUnit({
+              unitType: iterData.unitType,
+              unitId: iterData.unitId,
+            });
+          finishIncompleteIteration({
+            status: "retry",
+            reason: breakReason,
+            retry: true,
+            unitType: iterData.unitType,
+            unitId: iterData.unitId,
+          });
+          finishTurn("retry", "execution", breakReason, "unit-retry");
+          continue;
+        }
         finishIncompleteIteration({
           status: "stopped",
           reason: breakReason,

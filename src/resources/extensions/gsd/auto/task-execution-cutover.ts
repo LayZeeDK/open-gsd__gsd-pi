@@ -343,11 +343,20 @@ function routeTaskFailure(
 // The terminal abort is resumable by design via `gsd_task_recovery_resume`, but that
 // tool requires the exact recoveryActionId. Carry the id in the break reason so it
 // reaches the journal, the dispatch ledger, and the operator instead of being discarded.
-function taskRecoveryAbortResult(recoveryActionId: string): UnitPhaseResult {
+function taskRecoveryAbortResult(
+  recoveryActionId: string,
+  options?: { standing?: boolean },
+): UnitPhaseResult {
   return {
     action: "break",
     reason:
       `task-recovery-abort (recoveryActionId: ${recoveryActionId}; resume with gsd_task_recovery_resume)`,
+    // Only the pre-dispatch gate below is `standing`: it refuses a Task that was
+    // ALREADY aborted before this run began, so reaching it means an operator
+    // relaunched into the wedge. Every other caller reaches here from a recovery
+    // minted by the run that just executed, where no operator authorized
+    // anything — resuming those would buy an unattended paid re-run.
+    ...(options?.standing ? { standingRecoveryActionId: recoveryActionId } : {}),
   };
 }
 
@@ -451,7 +460,7 @@ export async function runWithTaskExecutionAttempt(
           return { action: "next", data: {} };
         }
         if (recovery.action === "abort" && !recovery.resumeAuthorized) {
-          return taskRecoveryAbortResult(recovery.recoveryActionId);
+          return taskRecoveryAbortResult(recovery.recoveryActionId, { standing: true });
         }
       } else {
         if (!predecessor.resultId) {

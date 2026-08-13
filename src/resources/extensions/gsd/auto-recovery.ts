@@ -258,7 +258,7 @@ export function refreshRecoveryDbForArtifact(
           ok: false,
           fatal: true,
           reason: "execute-task-recovery-aborted",
-          message: `Stuck recovery found execute-task ${unitId} artifacts, but its canonical Task Attempt recovery already aborted (recoveryActionId: ${terminalAbort.recoveryActionId}); re-dispatching would break immediately with task-recovery-abort. Resume it with \`gsd_task_recovery_resume\` using recoveryActionId ${terminalAbort.recoveryActionId}, or reconcile the projection drift with \`gsd rebuild markdown\` then \`gsd recover\`.`,
+          message: `Stuck recovery found execute-task ${unitId} artifacts, but its canonical Task Attempt recovery already aborted (recoveryActionId: ${terminalAbort.recoveryActionId}); this path will not re-dispatch it. Re-run \`/gsd auto\` or \`/gsd next\`, which resumes a standing abort once per failure kind and re-dispatches the unit. If that has already been spent, resume it with \`gsd_task_recovery_resume\` using recoveryActionId ${terminalAbort.recoveryActionId} and real repair evidence, or reconcile the projection drift with \`gsd rebuild markdown\` then \`gsd recover\`.`,
         };
       }
     }

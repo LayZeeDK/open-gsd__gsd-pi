@@ -28,6 +28,7 @@ import type { WorktreeStateProjection } from "../worktree-state-projection.js";
 import type { CmuxLogLevel } from "../../shared/cmux-events.js";
 import type { JournalEntry } from "../journal.js";
 import type { MergeReconcileResult } from "../auto-recovery.js";
+import type { StandingAbortResolution } from "./task-recovery-relaunch.js";
 import type { UokTurnObserver } from "../uok/contracts.js";
 import type { PostflightResult, PreflightResult } from "../clean-root-preflight.js";
 import type { VerificationOutcome } from "../custom-verification.js";
@@ -102,6 +103,16 @@ export interface LoopDeps {
     run: () => Promise<UnitPhaseResult>,
     deps: TaskExecutionCutoverDeps,
   ) => Promise<UnitPhaseResult>;
+  /**
+   * Resolve a standing agent-owned Task recovery abort so the relaunch can make
+   * progress instead of breaking forever. Injected so loop tests can drive the
+   * resumed/exhausted branches without a database; defaults to the real
+   * `resumeStandingTaskRecoveryAbort`.
+   */
+  resumeStandingTaskRecoveryAbort?: (
+    unitType: string,
+    unitId: string,
+  ) => StandingAbortResolution;
   taskPublicationBoundary?: (
     input: VerifiedTaskPublicationInput,
     deps: VerifiedTaskPublicationDeps,
