@@ -54,6 +54,11 @@ Full build, link and rebase procedure: **[FORK.md](FORK.md)**.
 | 19 | `9afe19e5` | per-condition diagnosis for a refused recovery resume | not filed |
 | 20 | `82cf0f1f` | relaunch resumes a standing task recovery abort | not filed |
 | 21 | `db9d2b2f` | a corrected re-run supersedes the failure it replaced | not filed |
+| 23 | `8dc70aa3` | an interactive submit that loses the streaming race | not filed |
+
+**22 is reserved, not missing.** `plans/049-verifier-broken-routes-to-replan.plan.md`
+claims it and has not landed. Renumber 23 down if that plan is dropped rather
+than leaving the hole permanent.
 
 Patch 8 spans **two** commits: `d44f1275` (`test(mcp-server): pin elicitation
 behaviour across client capability shapes`) lands `elicitation-capability.test.ts`
