@@ -214,6 +214,26 @@ async function runLoop(
 			newMessages.push(message);
 
 			if (message.stopReason === "error" || message.stopReason === "aborted") {
+				// NOT filled here, deliberately. This turn's tool calls go unanswered
+				// when the stream drops mid-call, and that is a real defect -- but it
+				// cannot be fixed by emitting synthetic results at this point.
+				//
+				// `Agent.processEvents` pushes every `message_end` into
+				// `_state.messages`, so emitting here would leave a `toolResult` as the
+				// tail instead of this assistant message. Five consumers read that tail
+				// to identify a failed turn, and all five would silently stop working:
+				// `prepareRetry`'s trim (agent-session-prompt.ts) would stop removing
+				// the failed turn, so every retry would GROW the context;
+				// `getNoProgressTerminalRetryFingerprint` would compare a fresh object
+				// by reference and never match, so identical failures would retry to
+				// the cap; the compaction recovery paths would stop dropping the error
+				// message; and print-mode's `state.messages[length - 1]` check would
+				// skip its error branch, so headless `gsd -p` would exit 0 on a run
+				// that died mid-stream.
+				//
+				// The transcript still needs repairing. The right seam is the session
+				// layer -- synthesize the missing results when a transcript is READ
+				// back, where the live message list is not involved. Own patch.
 				await emit({ type: "turn_end", message, toolResults: [] });
 				await emit({ type: "agent_end", messages: newMessages });
 				return;
@@ -235,9 +255,12 @@ async function runLoop(
 				}
 
 				const hasPreparationErrors = executedToolBatch.preparationErrorCount > 0;
+				// Count only really-executed results, so the abort fill cannot flip
+				// this guard. See `ExecutedToolCallBatch.syntheticResultCount`.
+				const executedResultCount = toolResults.length - executedToolBatch.syntheticResultCount;
 				const allToolsFailedPreparation =
-					toolResults.length > 0 &&
-					executedToolBatch.preparationErrorCount === toolResults.length;
+					executedResultCount > 0 &&
+					executedToolBatch.preparationErrorCount === executedResultCount;
 				if (allToolsFailedPreparation) {
 					consecutiveAllToolErrorTurns++;
 				} else if (!hasPreparationErrors) {
@@ -490,6 +513,17 @@ type ExecutedToolCallBatch = {
 	messages: ToolResultMessage[];
 	terminate: boolean;
 	preparationErrorCount: number;
+	/**
+	 * How many of `messages` are synthetic answers for calls an abort never ran.
+	 * `allToolsFailedPreparation` compares `preparationErrorCount` against the
+	 * result count, so without this the fill would silently flip that derived
+	 * guard: a 3-tool batch with one preparation failure goes from `1 === 1` to
+	 * `1 !== 3`, and `consecutiveAllToolErrorTurns` neither increments nor
+	 * resets. Whether an aborted batch SHOULD count toward that model-error loop
+	 * is a separate question; this patch is a message-contract fix and leaves
+	 * the guard's meaning exactly as it was.
+	 */
+	syntheticResultCount: number;
 };
 
 async function executeToolCallsSequential(
@@ -546,10 +580,18 @@ async function executeToolCallsSequential(
 		}
 	}
 
+	const filled = await fillUnansweredToolCalls(
+		toolCalls,
+		messages.map((message) => message.toolCallId),
+		emit,
+	);
+	messages.push(...filled);
+
 	return {
 		messages,
 		terminate: shouldTerminateToolBatch(finalizedCalls),
 		preparationErrorCount,
+		syntheticResultCount: filled.length,
 	};
 }
 
@@ -618,10 +660,21 @@ async function executeToolCallsParallel(
 		messages.push(toolResultMessage);
 	}
 
+	// After `Promise.all`, not after the `for` loop above: that loop pushes
+	// THUNKS, which carry no `toolCall`, so until they resolve there is no way to
+	// tell which calls are unanswered.
+	const filled = await fillUnansweredToolCalls(
+		toolCalls,
+		messages.map((message) => message.toolCallId),
+		emit,
+	);
+	messages.push(...filled);
+
 	return {
 		messages,
 		terminate: shouldTerminateToolBatch(orderedFinalizedCalls),
 		preparationErrorCount,
+		syntheticResultCount: filled.length,
 	};
 }
 
@@ -954,4 +1007,65 @@ function createToolResultMessage(finalized: FinalizedToolCallOutcome): ToolResul
 async function emitToolResultMessage(toolResultMessage: ToolResultMessage, emit: AgentEventSink): Promise<void> {
 	await emit({ type: "message_start", message: toolResultMessage });
 	await emit({ type: "message_end", message: toolResultMessage });
+}
+
+/**
+ * Exported so downstream readers of a persisted transcript can recognise a
+ * synthetic abort answer instead of reporting it as a tool failure that never
+ * happened -- see `session-forensics.ts`, which filters it out of the
+ * crash-recovery briefing.
+ */
+export const ABORTED_TOOL_CALL_TEXT =
+	"Not executed: the run was aborted before this tool call started.";
+
+/**
+ * Answer every `toolCall` an abort left unanswered.
+ *
+ * The Anthropic message contract requires one `tool_result` per `tool_use` in
+ * the following user message. Every abort path can currently break it, and the
+ * damage is durable rather than cosmetic: GSD persistence is event-driven
+ * (`agent-session-events.ts` appends on `message_end`), so a malformed turn is
+ * written to the session file and poisons every later resume.
+ *
+ * That is why these are EMITTED rather than appended to the returned array --
+ * appending repairs memory and leaves the file exactly as malformed.
+ *
+ * No `tool_execution_end` is emitted: `tool_execution_start` fires at the top of
+ * each executor loop iteration, so a call that never started has no matching
+ * start, and pairing an end to nothing hands the TUI a malformed event stream.
+ *
+ * Synthetics deliberately do NOT participate in the terminate decision: they are
+ * never pushed into `finalizedCalls`, so `shouldTerminateToolBatch` still sees
+ * only real outcomes and `terminate` is byte-identical to today. The plan called
+ * for inheriting a `terminate` flag onto each synthetic, but that value would be
+ * dead twice over -- `createToolResultMessage` does not copy `terminate` onto the
+ * message, and the batch never sees these entries. Keeping them out is also the
+ * safer half of the plan's own argument: an all-synthetic batch can never make
+ * `every(... terminate === true)` vacuously true and end a turn silently.
+ */
+async function fillUnansweredToolCalls(
+	toolCalls: AgentToolCall[],
+	answered: Iterable<string>,
+	emit: AgentEventSink,
+): Promise<ToolResultMessage[]> {
+	const answeredIds = new Set(answered);
+	const missing = toolCalls.filter((toolCall) => !answeredIds.has(toolCall.id));
+	if (missing.length === 0) {
+		return [];
+	}
+
+	const filled: ToolResultMessage[] = [];
+	for (const toolCall of missing) {
+		const toolResultMessage = createToolResultMessage({
+			toolCall,
+			result: {
+				content: [{ type: "text", text: ABORTED_TOOL_CALL_TEXT }],
+				details: undefined,
+			},
+			isError: true,
+		});
+		await emitToolResultMessage(toolResultMessage, emit);
+		filled.push(toolResultMessage);
+	}
+	return filled;
 }

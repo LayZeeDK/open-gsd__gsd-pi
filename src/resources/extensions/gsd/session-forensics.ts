@@ -89,6 +89,21 @@ function isReadOnlyReconnaissanceTool(call: ToolCall): boolean {
   return READ_ONLY_EXEC_COMMAND_RE.test(command);
 }
 
+/**
+ * True for the synthetic answer the agent loop writes when an abort leaves a
+ * tool call unrun (`ABORTED_TOOL_CALL_TEXT` in pi-agent-core's `agent-loop`).
+ *
+ * Matched as a literal here, following this file's existing `isUserSkip` /
+ * `isBenignNoMatch` convention, rather than importing a runtime module into a
+ * JSONL reader. Exported so the drift test can exercise THIS predicate rather
+ * than a third copy of the pattern -- a copy would only catch drift on the
+ * producer side, and would stay green if this regex were narrowed or rewritten
+ * by an upstream rebase.
+ */
+export function isAbortedNotExecutedResult(resultText: string): boolean {
+  return /^Not executed: the run was aborted/i.test(resultText.trim());
+}
+
 export function classifyTraceProgress(trace: ExecutionTrace): { isReadOnlyReconnaissanceOnly: boolean } {
   if (trace.toolCalls.length === 0) return { isReadOnlyReconnaissanceOnly: false };
   for (const call of trace.toolCalls) {
@@ -187,6 +202,36 @@ export function extractTrace(entries: unknown[]): ExecutionTrace {
       const id = String(msg.toolCallId || "");
       const isError = !!msg.isError;
       const resultText = extractResultText(msg);
+      // A synthetic answer the agent loop writes for a tool call an abort never
+      // ran. Leave it PENDING and let the flush loop below handle it exactly as
+      // it handled the missing result before those synthetics existed: the call
+      // is recorded with `isError: true`, its bash/bg_shell command is marked
+      // failed, and `toolCallCount` still counts it.
+      //
+      // Consuming it here instead looks tidier and is wrong. `commandsRun`,
+      // `filesWritten` and `filesRead` are all pushed when the toolCall block is
+      // PARSED, before any result, so dropping only the result leaves a
+      // never-run command at `failed: false` -- rendered under "Commands
+      // Already Run" with a check mark, under an instruction telling the
+      // resuming agent not to re-run what already succeeded. For a command like
+      // a deploy or an `rm -rf`, that is worse than the phantom error it was
+      // meant to remove. It can also drive `toolCallCount` to 0, which sends
+      // `synthesizeCrashRecovery` into its project-wide activity-log fallback
+      // and briefs the operator with a DIFFERENT unit's history.
+      //
+      // The flush loop repairs `commandsRun` only, and only for bash/bg_shell.
+      // A never-run `write`/`edit` still leaves its path under "Files Already
+      // Written/Edited" -- pre-existing, and NOT fixed here: `seenWritten`
+      // dedups by path, so a path also written by a call that really succeeded
+      // has one entry, and removing it would hide the real write. Distinguishing
+      // the two needs more than this seam has.
+      //
+      // Gated on `isError` as well as the text: a genuine successful result
+      // that happens to quote this sentence -- plausible when the tool being
+      // run is reading a session transcript -- must not be dropped.
+      if (isError && isAbortedNotExecutedResult(resultText)) {
+        continue;
+      }
 
       const pending = pendingTools.get(id);
       if (pending) {

@@ -8,7 +8,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
-import { agentLoop, agentLoopContinue } from "../src/agent-loop.ts";
+import { agentLoop, agentLoopContinue, MAX_CONSECUTIVE_VALIDATION_FAILURES } from "../src/agent-loop.ts";
 import type { AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentTool, AgentToolResult } from "../src/types.ts";
 
 // Mock stream for testing - mimics MockAssistantStream
@@ -1961,5 +1961,401 @@ describe("agentLoopContinue with AgentMessage", () => {
 		const messages = await stream.result();
 		expect(messages.length).toBe(1);
 		expect(messages[0].role).toBe("assistant");
+	});
+});
+
+describe("aborting must not leave tool calls unanswered", () => {
+	// The Anthropic message contract requires one `tool_result` per `tool_use` in
+	// the following user message. GSD persistence is event-driven (it appends on
+	// `message_end`), so a malformed turn is written to the session file and
+	// poisons every later resume -- which is why these assert on the EMITTED
+	// events, not just the returned array.
+	const echoSchema = Type.Object({ value: Type.String() });
+
+	function toolCallBlock(id: string, name = "echo"): AssistantMessage["content"][number] {
+		return { type: "toolCall", id, name, arguments: { value: id } } as AssistantMessage["content"][number];
+	}
+
+	function collectResultIds(events: AgentEvent[], type: "message_end" | "message_start"): string[] {
+		return events.flatMap((event) => {
+			if (event.type !== type) return [];
+			const message = (event as unknown as { message?: { role?: string; toolCallId?: string } }).message;
+			return message?.role === "toolResult" && message.toolCallId ? [message.toolCallId] : [];
+		});
+	}
+
+	function assertWellFormed(assistant: AssistantMessage, results: { toolCallId: string }[]): void {
+		const callIds = assistant.content
+			.filter((c) => c.type === "toolCall")
+			.map((c) => (c as unknown as { id: string }).id);
+		for (const callId of callIds) {
+			const matching = results.filter((result) => result.toolCallId === callId);
+			expect(matching.length, `expected exactly one toolResult for ${callId}`).toBe(1);
+		}
+	}
+
+
+	it("leaves the aborted assistant message as the last emitted message", async () => {
+		// Deliberate non-fill, pinned. `Agent.processEvents` pushes every
+		// `message_end` into `_state.messages`, and five consumers identify a failed
+		// turn by reading the TAIL of that list: prepareRetry's trim, the
+		// no-progress retry fingerprint, two compaction recovery paths, and
+		// print-mode's error branch (which sets the headless exit code). Emitting a
+		// synthetic toolResult here would make the tail a toolResult and silently
+		// break all five -- notably `gsd -p` would exit 0 on a run that died
+		// mid-stream. The transcript still needs repairing; the seam for that is the
+		// session layer, on read-back.
+		const context: AgentContext = { systemPrompt: "", messages: [], tools: [] };
+		const config: AgentLoopConfig = { model: createModel(), convertToLlm: identityConverter };
+		const assistant = createAssistantMessage([toolCallBlock("call-1"), toolCallBlock("call-2")], "aborted");
+		const streamFn = () => {
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => stream.push({ type: "done", reason: "aborted", message: assistant }));
+			return stream;
+		};
+
+		const events: AgentEvent[] = [];
+		const stream = agentLoop([createUserMessage("go")], context, config, undefined, streamFn);
+		for await (const event of stream) events.push(event);
+		const messages = await stream.result();
+
+		const endedMessages = events.flatMap((event) =>
+			event.type === "message_end"
+				? [(event as unknown as { message: { role: string } }).message]
+				: [],
+		);
+		expect(endedMessages.length).toBeGreaterThan(0);
+		expect(endedMessages[endedMessages.length - 1].role).toBe("assistant");
+		expect(messages[messages.length - 1].role).toBe("assistant");
+		expect(messages.some((m) => m.role === "toolResult")).toBe(false);
+	});
+	it("answers the calls a sequential batch never reached after an abort", async () => {
+		const controller = new AbortController();
+		const tool: AgentTool<typeof echoSchema, { value: string }> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: echoSchema,
+			executionMode: "sequential",
+			async execute(_toolCallId, params): Promise<AgentToolResult<{ value: string }>> {
+				// Abort while the FIRST call runs, so the second never starts.
+				controller.abort();
+				return { content: [{ type: "text", text: params.value }], details: { value: params.value } };
+			},
+		};
+
+		const context: AgentContext = { systemPrompt: "", messages: [], tools: [tool] };
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			toolExecution: "sequential",
+		};
+		const assistant = createAssistantMessage([toolCallBlock("call-1"), toolCallBlock("call-2")]);
+		// Serve the tool-call turn ONCE. The batch does not terminate (the echo tool
+		// sets no `terminate`), so the loop asks for another turn -- unchanged by
+		// this patch, since `terminate` is still computed from the real outcomes
+		// only. A mock that re-served the same tool calls would spin forever.
+		let served = false;
+		const streamFn = () => {
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				if (!served) {
+					served = true;
+					stream.push({ type: "done", reason: "stop", message: assistant });
+					return;
+				}
+				stream.push({
+					type: "done",
+					reason: "stop",
+					message: createAssistantMessage([{ type: "text", text: "done" }]),
+				});
+			});
+			return stream;
+		};
+
+		const events: AgentEvent[] = [];
+		const stream = agentLoop([createUserMessage("go")], context, config, controller.signal, streamFn);
+		for await (const event of stream) events.push(event);
+		const messages = await stream.result();
+
+		const results = messages.filter((m) => m.role === "toolResult") as unknown as { toolCallId: string }[];
+		assertWellFormed(assistant, results);
+		expect(collectResultIds(events, "message_end").sort()).toEqual(["call-1", "call-2"]);
+	});
+
+
+	it("answers the calls a PARALLEL batch never reached after an abort", async () => {
+		// Parallel is the DEFAULT execution mode, so this is the headline scenario:
+		// Ctrl-C during a multi-tool batch. Without this the parallel fill is
+		// unpinned -- deleting it leaves the whole suite green.
+		//
+		// The abort must land inside `beforeToolCall`/`prepareToolCall`, NOT inside
+		// `execute`: by the time any thunk runs, every call has already been queued
+		// by the `for` loop, so the loop's abort break never fires and there is
+		// nothing left unanswered.
+		const controller = new AbortController();
+		const tool: AgentTool<typeof echoSchema, { value: string }> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: echoSchema,
+			async execute(_toolCallId, params): Promise<AgentToolResult<{ value: string }>> {
+				return { content: [{ type: "text", text: params.value }], details: { value: params.value } };
+			},
+		};
+
+		const context: AgentContext = { systemPrompt: "", messages: [], tools: [tool] };
+		let prepared = 0;
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			// Default toolExecution (parallel) -- deliberately not set.
+			beforeToolCall: async () => {
+				prepared++;
+				if (prepared === 1) controller.abort();
+				return {};
+			},
+		};
+
+		let served = false;
+		const assistant = createAssistantMessage([
+			toolCallBlock("call-1"),
+			toolCallBlock("call-2"),
+			toolCallBlock("call-3"),
+		]);
+		const streamFn = () => {
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				if (!served) {
+					served = true;
+					stream.push({ type: "done", reason: "stop", message: assistant });
+					return;
+				}
+				stream.push({
+					type: "done",
+					reason: "stop",
+					message: createAssistantMessage([{ type: "text", text: "done" }]),
+				});
+			});
+			return stream;
+		};
+
+		const events: AgentEvent[] = [];
+		const stream = agentLoop([createUserMessage("go")], context, config, controller.signal, streamFn);
+		for await (const event of stream) events.push(event);
+		const messages = await stream.result();
+
+		const results = messages.filter((m) => m.role === "toolResult") as unknown as { toolCallId: string }[];
+		assertWellFormed(assistant, results);
+		expect(collectResultIds(events, "message_end").sort()).toEqual(["call-1", "call-2", "call-3"]);
+	});
+
+	it("emits no tool_execution_end for a synthetic answer", async () => {
+		// `tool_execution_start` fires at the top of each executor iteration, so a
+		// call that never started has no matching start. An unmatched end makes the
+		// transcript renderer push a phantom tool card and makes
+		// `Agent.processEvents` delete an id it never added to `pendingToolCalls`.
+		const controller = new AbortController();
+		const tool: AgentTool<typeof echoSchema, { value: string }> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: echoSchema,
+			executionMode: "sequential",
+			async execute(_toolCallId, params): Promise<AgentToolResult<{ value: string }>> {
+				controller.abort();
+				return { content: [{ type: "text", text: params.value }], details: { value: params.value } };
+			},
+		};
+
+		const context: AgentContext = { systemPrompt: "", messages: [], tools: [tool] };
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			toolExecution: "sequential",
+		};
+		let served = false;
+		const assistant = createAssistantMessage([toolCallBlock("call-1"), toolCallBlock("call-2")]);
+		const streamFn = () => {
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				if (!served) {
+					served = true;
+					stream.push({ type: "done", reason: "stop", message: assistant });
+					return;
+				}
+				stream.push({
+					type: "done",
+					reason: "stop",
+					message: createAssistantMessage([{ type: "text", text: "done" }]),
+				});
+			});
+			return stream;
+		};
+
+		const events: AgentEvent[] = [];
+		const stream = agentLoop([createUserMessage("go")], context, config, controller.signal, streamFn);
+		for await (const event of stream) events.push(event);
+		await stream.result();
+
+		const startedIds = events.flatMap((event) =>
+			event.type === "tool_execution_start" ? [(event as unknown as { toolCallId: string }).toolCallId] : [],
+		);
+		const endedIds = events.flatMap((event) =>
+			event.type === "tool_execution_end" ? [(event as unknown as { toolCallId: string }).toolCallId] : [],
+		);
+		// call-2 was answered synthetically, so it must appear in NEITHER.
+		expect(startedIds).toEqual(["call-1"]);
+		expect(endedIds).toEqual(["call-1"]);
+		expect(collectResultIds(events, "message_end").sort()).toEqual(["call-1", "call-2"]);
+	});
+	it("leaves a completed batch unchanged", async () => {
+		// Negative: the fill must add nothing when nothing was aborted.
+		// `createToolResultMessage` stamps `Date.now()`, so compare the identifying
+		// fields rather than claiming byte-identity.
+		const tool: AgentTool<typeof echoSchema, { value: string }> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: echoSchema,
+			async execute(_toolCallId, params): Promise<AgentToolResult<{ value: string }>> {
+				return { content: [{ type: "text", text: params.value }], details: { value: params.value } };
+			},
+		};
+
+		const context: AgentContext = { systemPrompt: "", messages: [], tools: [tool] };
+		const config: AgentLoopConfig = { model: createModel(), convertToLlm: identityConverter };
+		let served = false;
+		const assistant = createAssistantMessage([toolCallBlock("call-1"), toolCallBlock("call-2")]);
+		const streamFn = () => {
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				if (!served) {
+					served = true;
+					stream.push({ type: "done", reason: "stop", message: assistant });
+					return;
+				}
+				stream.push({
+					type: "done",
+					reason: "stop",
+					message: createAssistantMessage([{ type: "text", text: "done" }]),
+				});
+			});
+			return stream;
+		};
+
+		const events: AgentEvent[] = [];
+		const stream = agentLoop([createUserMessage("go")], context, config, undefined, streamFn);
+		for await (const event of stream) events.push(event);
+		const messages = await stream.result();
+
+		const results = messages.filter((m) => m.role === "toolResult") as unknown as {
+			toolCallId: string;
+			isError: boolean;
+			content: { type: string; text: string }[];
+		}[];
+		expect(results.map((result) => result.toolCallId)).toEqual(["call-1", "call-2"]);
+		expect(results.some((result) => result.isError)).toBe(false);
+		// Mutant guard: an unconditional fill would duplicate these ids.
+		expect(collectResultIds(events, "message_end")).toEqual(["call-1", "call-2"]);
+		expect(results.map((result) => result.content[0].text)).toEqual(["call-1", "call-2"]);
+	});
+
+	it("keeps allToolsFailedPreparation counting only really-executed results", async () => {
+		// The fill raises `toolResults.length` without touching
+		// `preparationErrorCount`, so comparing the two directly would silently flip
+		// this derived guard: a batch with one preparation failure plus one
+		// never-reached call goes from `1 === 1` to `1 !== 2`, and
+		// `consecutiveAllToolErrorTurns` would neither increment nor reset.
+		// Asserting the raw count passes green while the guard changes -- so this
+		// asserts the DERIVED effect: the validation-failure stop still fires.
+		const toolSchema = Type.Object({ value: Type.String() });
+		const controller = new AbortController();
+		const tool: AgentTool<typeof toolSchema> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: toolSchema,
+			executionMode: "sequential",
+			async execute() {
+				throw new Error("tool should have been blocked before execution");
+			},
+		};
+
+		const context: AgentContext = { systemPrompt: "", messages: [], tools: [tool] };
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			toolExecution: "sequential",
+			// NB: the `block` result below is never actually read. `prepareToolCall`
+			// checks `signal?.aborted` immediately after awaiting `beforeToolCall`
+			// and returns its own `Operation aborted` immediate error, which is what
+			// increments `preparationErrorCount` here. The hook is only a convenient
+			// place to trip the abort mid-batch.
+			beforeToolCall: async () => {
+				// Abort so the SECOND call in each batch is never reached, which is
+				// what makes the fill fire and the counts diverge.
+				controller.abort();
+				return { block: true, reason: "blocked" };
+			},
+		};
+
+		let turn = 0;
+		const streamFn = () => {
+			turn++;
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				if (turn <= MAX_CONSECUTIVE_VALIDATION_FAILURES) {
+					stream.push({
+						type: "done",
+						reason: "toolUse",
+						message: createAssistantMessage(
+							[
+								{ type: "toolCall", id: `a-${turn}`, name: "echo", arguments: { value: "x" } },
+								{ type: "toolCall", id: `b-${turn}`, name: "echo", arguments: { value: "y" } },
+							] as AssistantMessage["content"],
+							"toolUse",
+						),
+					});
+					return;
+				}
+				stream.push({
+					type: "done",
+					reason: "stop",
+					message: createAssistantMessage([{ type: "text", text: "done" }]),
+				});
+			});
+			return stream;
+		};
+
+		const events: AgentEvent[] = [];
+		const stream = agentLoop([createUserMessage("go")], context, config, controller.signal, streamFn);
+		for await (const event of stream) events.push(event);
+		const messages = await stream.result();
+
+		// Every tool call is still answered exactly once, on every turn.
+		for (const message of messages) {
+			if (message.role !== "assistant") continue;
+			const assistant = message as unknown as AssistantMessage;
+			const callIds = assistant.content
+				.filter((c) => c.type === "toolCall")
+				.map((c) => (c as unknown as { id: string }).id);
+			for (const callId of callIds) {
+				const answers = messages.filter(
+					(m) => m.role === "toolResult" && (m as unknown as { toolCallId: string }).toolCallId === callId,
+				);
+				expect(answers.length, `expected exactly one toolResult for ${callId}`).toBe(1);
+			}
+		}
+
+		// The derived guard still trips: without the syntheticResultCount
+		// subtraction the counter never increments and this stop never appears.
+		const stopped = messages.some(
+			(m) =>
+				m.role === "assistant" &&
+				(m as unknown as { errorMessage?: string }).errorMessage ===
+					"Schema overload: consecutive tool validation failures exceeded cap",
+		);
+		expect(stopped).toBe(true);
 	});
 });
