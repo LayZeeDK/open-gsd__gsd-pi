@@ -57,6 +57,10 @@ bun.lock
 !integrations/hermes/tests/fixtures/minimal-project/.gsd/**
 .audits/
 .plans/
+
+# Fork-internal working notes: patch plans and diagnosis reports.
+# plans/ upstream is for upstream plans only.
+.fork/
 docs/coherence-audit/
 
 # Local MCP client config
