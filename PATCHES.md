@@ -47,18 +47,15 @@ Full build, link and rebase procedure: **[FORK.md](FORK.md)**.
 | 12 | `5356a387` | `error.cause` in re-wrapped projection failures | not filed |
 | 13 | `780a66c7` | headless doctor argument refusal (**breaking**) | not filed |
 | 14 | `3b8cb835` | depth-gate arming paired with a delivery rollback | not filed |
-| 15 | `2f925973` | milestone-lease reentrancy across the process split | not filed |
-| 16 | `3f59fd4b` | DB-authoritative plan-milestone verification | not filed |
-| 17 | `a906814c` | milestone-scoped derivation vs. out-of-scope dependencies | not filed |
-| 18 | `21209a67` | first-strike abort for evidence cross-reference contradictions | not filed |
-| 19 | `9afe19e5` | per-condition diagnosis for a refused recovery resume | not filed |
-| 20 | `82cf0f1f` | relaunch resumes a standing task recovery abort | not filed |
-| 21 | `db9d2b2f` | a corrected re-run supersedes the failure it replaced | not filed |
-| 23 | `8dc70aa3` | an interactive submit that loses the streaming race | not filed |
-
-**22 is reserved, not missing.** `plans/049-verifier-broken-routes-to-replan.plan.md`
-claims it and has not landed. Renumber 23 down if that plan is dropped rather
-than leaving the hole permanent.
+| 15 | `0636a3d8` | milestone-lease reentrancy across the process split | not filed |
+| 16 | `190a2a99` | DB-authoritative plan-milestone verification | not filed |
+| 17 | `fc4a46bb` | milestone-scoped derivation vs. out-of-scope dependencies | not filed |
+| 18 | `51c5e914` | first-strike abort for evidence cross-reference contradictions | not filed |
+| 19 | `05dc2e05` | per-condition diagnosis for a refused recovery resume | not filed |
+| 20 | `e1403e03` | relaunch resumes a standing task recovery abort | not filed |
+| 21 | `5f7512c9` | a corrected re-run supersedes the failure it replaced | not filed |
+| 22 | `b75d2f63` | verification output truncation kept the head, not the error | not filed |
+| 23 | `9e07c897` | an interactive submit that loses the streaming race | not filed |
 
 Patch 8 spans **two** commits: `d44f1275` (`test(mcp-server): pin elicitation
 behaviour across client capability shapes`) lands `elicitation-capability.test.ts`
@@ -616,7 +613,7 @@ subcommand to work around the dropped argv.
 form elicitation, and the *first* failed attempt bricked the whole session --
 `CONTEXT-DRAFT` too, and all bash. Reported against consumer project
 `ngx-foundation-sites`, milestone `M002`
-([blocker report](docs/dev/2026-08-11-milestone-context-elicitation-gate-blocker.md)).
+(blocker report kept out of the repo).
 
 **Cause.** Not "the wrong error is returned". The gate is armed *before* delivery
 is attempted and nothing rolls it back when delivery fails. With `pendingGateId`
@@ -724,7 +721,7 @@ on model compliance, which is exactly what a mechanical gate exists not to rely
 on). Deleting `.gsd/runtime/write-gate-state.json` remains the documented
 stopgap; it was already the supported reset.
 
-### 15. Make the milestone-lease reentrancy check survive the process split -- `2f925973`
+### 15. Make the milestone-lease reentrancy check survive the process split -- `0636a3d8`
 
 **Commit order is load-bearing: 15 before 16, and 16 must not be cherry-picked
 upstream without 15.** Patch 16 alone converts today's false success into three
@@ -735,7 +732,7 @@ still lease-blocked.
 never be planned by that run. Every nested `gsd_plan_milestone` is rejected as a
 conflict against its own orchestrator's lease. Reported against consumer project
 `ngx-foundation-sites`, milestone `M002`
-([incident report](docs/dev/2026-08-11-plan-milestone-lease-self-deadlock.md)).
+(incident report kept out of the repo).
 
 **Cause.** `executePlanMilestone` proved reentrancy with in-process state
 (`isAutoActive()`, `autoSession.workerId`) and `holder.pid === process.pid`. The
@@ -877,7 +874,7 @@ red.
 
 ---
 
-### 16. Make plan-milestone verification DB-authoritative -- `3f59fd4b`
+### 16. Make plan-milestone verification DB-authoritative -- `190a2a99`
 
 **Symptom.** The same reported unit finalized `completed` /
 `artifactVerified: true` with nothing durable written. `renderRoadmapFromDb`
@@ -1055,7 +1052,7 @@ blockers, next dispatch `research-slice M002/S01`.
 
 ---
 
-### 17. Judge milestone dependencies against all milestones under a scope lock -- `a906814c`
+### 17. Judge milestone dependencies against all milestones under a scope lock -- `fc4a46bb`
 
 **Symptom.** A `queued`/`planned` milestone could not be reached from any menu.
 `/gsd auto M002` and `/gsd next M002` both rendered the idle three-option menu --
@@ -1064,7 +1061,7 @@ milestone dependencies before proceeding.", and the only forward action mints a
 *new* milestone ID. Naming `M002` on the command line appeared to have no effect.
 Reproduced twice in `ngx-foundation-sites-gsd-pi`, at 0 slices and again at
 `planned` with 5 slices and 17 tasks, so it is not specific to an empty milestone
-([incident report](docs/dev/queued-milestone-not-resumable.md)).
+(incident report kept out of the repo).
 
 **Cause.** Not the menu. Naming a milestone exports `GSD_MILESTONE_LOCK`
 (`commands/handlers/auto.ts` -> `auto.ts:441`), and `deriveStateFromDb` filters the
