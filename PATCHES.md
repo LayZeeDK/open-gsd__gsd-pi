@@ -56,6 +56,8 @@ Full build, link and rebase procedure: **[FORK.md](FORK.md)**.
 | 21 | `5f7512c9` | a corrected re-run supersedes the failure it replaced | not filed |
 | 22 | `b75d2f63` | verification output truncation kept the head, not the error | not filed |
 | 23 | `9e07c897` | an interactive submit that loses the streaming race | not filed |
+| 24 | `ddf5adf7` | read back the task contract `gsd_replan_task` demands | not filed |
+| 25 | `a9f89297` | answer tool calls an aborted tool batch leaves unresolved | not filed |
 
 Patch 8 spans **two** commits: `d44f1275` (`test(mcp-server): pin elicitation
 behaviour across client capability shapes`) lands `elicitation-capability.test.ts`

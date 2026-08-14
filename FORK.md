@@ -439,8 +439,30 @@ node --import ./src/resources/extensions/gsd/tests/resolve-ts.mjs \
      src/resources/extensions/gsd/tests/recovery-policy.test.ts \
      src/resources/extensions/gsd/tests/auto-recovery.test.ts \
      src/resources/extensions/gsd/tests/task-recovery-resume-diagnosis.test.ts \
-     src/resources/extensions/gsd/tests/task-recovery-relaunch.test.ts \n     src/resources/extensions/gsd/tests/evidence-cross-ref.test.ts
+     src/resources/extensions/gsd/tests/task-recovery-relaunch.test.ts \
+     src/resources/extensions/gsd/tests/evidence-cross-ref.test.ts \
+     src/resources/extensions/gsd/tests/task-contract-tool.test.ts \
+     src/resources/extensions/gsd/tests/session-forensics-aborted-filter.test.ts
 ```
+
+> The line before `evidence-cross-ref.test.ts` carried a literal \n instead of a
+> newline, which truncated the command there -- every suite after it went unrun
+> while the list still looked complete. Fixed with patch 25.
+>
+> `task-contract-tool.test.ts` arrived with patch 24 and
+> `session-forensics-aborted-filter.test.ts` with patch 25.
+
+Patch 25 also lands tests in `packages/pi-agent-core`, which **no gate in this
+repo runs**: `run-package-tests.cjs` walks only `dist-test/packages/*/src`,
+`compile-tests.mjs` deletes `dist-test/packages/*/test`, and CI never invokes the
+package. That predates the fork and applies to all four files in that directory,
+so run it by hand:
+
+```bash
+pnpm --filter @gsd/pi-agent-core exec vitest --run test/agent-loop.test.ts
+```
+
+> Expect **34 of 34**. It is a vitest suite -- do not add `node:test` cases to it.
 
 > The last four arrived with patches 18 and 19. Patch 18 redefines a shared
 > value -- the recovery `action` an evidence contradiction routes -- so per
