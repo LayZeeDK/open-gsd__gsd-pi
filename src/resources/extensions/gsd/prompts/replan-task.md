@@ -19,8 +19,9 @@ Source: `{{taskPlanPath}}`
 ## Instructions
 
 1. Use the durable failure evidence, rationale, and Work Checkpoint above to correct the plan.
-2. Call `gsd_replan_task` with `milestoneId`, `sliceId`, `taskId`, `title`, `description`, `estimate`, `files`, `verify`, `inputs`, and `expectedOutput`. Include `triggerReason` describing the recovery action.
-3. Preserve valid scope and constraints from the current plan, but replace the invalid steps. Do not widen the Task or redesign other tasks in the slice.
-4. After `gsd_replan_task` succeeds, stop. The orchestrator will claim a new execution Attempt from the replacement plan.
+2. Call `gsd_task_contract` with `milestoneId`, `sliceId`, and `taskId` to read the task's stored planning contract. `gsd_replan_task` requires every field, so resend the ones you are not deliberately changing exactly as this returns them. Do not reconstruct `inputs` or `expectedOutput` from a naming convention -- that silently rewrites plan data and the replan still reports success. Check `unresendableFields` before resending: anything it lists would be rejected and needs a deliberate value.
+3. Call `gsd_replan_task` with `milestoneId`, `sliceId`, `taskId`, `title`, `description`, `estimate`, `files`, `verify`, `inputs`, and `expectedOutput`. Include `triggerReason` describing the recovery action.
+4. Preserve valid scope and constraints from the current plan, but replace the invalid steps. Do not widen the Task or redesign other tasks in the slice.
+5. After `gsd_replan_task` succeeds, stop. The orchestrator will claim a new execution Attempt from the replacement plan.
 
 When done, say: "Task {{taskId}} replanned."

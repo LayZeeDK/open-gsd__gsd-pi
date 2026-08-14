@@ -225,6 +225,14 @@ export const WORKFLOW_TOOL_CONTRACTS = [
 		auditEvent: "workflow.milestone.status",
 	},
 	{
+		canonicalName: "gsd_task_contract",
+		aliases: [],
+		schemaId: "workflow.task.contract",
+		executorId: "executeTaskContract",
+		writePolicy: "read",
+		auditEvent: "workflow.task.contract",
+	},
+	{
 		canonicalName: "gsd_checkpoint_db",
 		aliases: [],
 		schemaId: "workflow.database.checkpoint",

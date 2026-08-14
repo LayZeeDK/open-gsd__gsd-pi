@@ -92,6 +92,10 @@ type WorkflowToolExecutors = {
       turnId?: string;
     },
   ) => Promise<unknown>;
+  executeTaskContract: (
+    params: { milestoneId: string; sliceId: string; taskId: string },
+    basePath?: string,
+  ) => Promise<unknown>;
   executePlanMilestone: (
     params: {
       milestoneId: string;
@@ -753,6 +757,7 @@ function isWorkflowToolExecutors(value: unknown): value is WorkflowToolExecutors
   const record = value as Record<string, unknown>;
   const functionExports = [
     "executeMilestoneStatus",
+    "executeTaskContract",
     "executePlanMilestone",
     "executePlanSlice",
     "executeReplanSlice",
@@ -2379,6 +2384,14 @@ const milestoneStatusParams = {
 };
 const milestoneStatusSchema = z.object(milestoneStatusParams);
 
+const taskContractParams = {
+  projectDir: projectDirParam,
+  milestoneId: nonEmptyString("milestoneId").describe("Milestone ID (e.g. M001)"),
+  sliceId: nonEmptyString("sliceId").describe("Slice ID (e.g. S01)"),
+  taskId: nonEmptyString("taskId").describe("Task ID (e.g. T01)"),
+};
+const taskContractSchema = z.object(taskContractParams);
+
 const checkpointDbParams = {
   projectDir: projectDirParam,
 };
@@ -3435,6 +3448,26 @@ export function registerWorkflowTools(
           { milestoneId },
           projectDir,
           observationContext,
+        )),
+      );
+    },
+  );
+
+  server.tool(
+    "gsd_task_contract",
+    "Read back the exact planning contract gsd_replan_task requires for one task (title, description, estimate, files, verify, inputs, expectedOutput). Call this before gsd_replan_task and resend untouched fields verbatim rather than reconstructing them.",
+    taskContractParams,
+    async (args: Record<string, unknown>) => {
+      // gsd_task_contract is a read-only query. In-process (query-tools.ts) does
+      // not apply the write-gate; MCP must match, or the read that exists to
+      // prevent a bad write would itself be blocked during pending-gate or
+      // queue-mode states -- exactly when a caller is trying to repair a plan.
+      const { projectDir, milestoneId, sliceId, taskId } = parseWorkflowArgs(taskContractSchema, args);
+      const executors = await getWorkflowToolExecutors();
+      return adaptExecutorResult(
+        await runSerializedWorkflowOperation(() => executors.executeTaskContract(
+          { milestoneId, sliceId, taskId },
+          projectDir,
         )),
       );
     },

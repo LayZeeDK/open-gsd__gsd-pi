@@ -272,7 +272,12 @@ export const UNIT_REGISTRY = {
     phaseChain: ["planning"],
     promptTemplate: "replan-slice",
     toolContract: {
-      allowedGsdTools: ["gsd_replan_slice", "gsd_decision_save"],
+      // `gsd_replan_slice.updatedTasks` carries the FULL per-task contract and
+      // overwrites the stored values, so this unit has the same read-modify-
+      // write-with-no-read hazard `gsd_task_contract` exists to close -- and
+      // listing that read on any unit makes it a scoped lifecycle tool, so
+      // omitting it here would hard-block the unit that needs it most.
+      allowedGsdTools: ["gsd_task_contract", "gsd_replan_slice", "gsd_decision_save"],
       requiredWorkflowTools: ["gsd_replan_slice"],
     },
   },
@@ -289,6 +294,7 @@ export const UNIT_REGISTRY = {
         "gsd_resume",
         "gsd_slice_complete",
         "gsd_task_reopen",
+        "gsd_task_contract",
         "gsd_replan_slice",
         "gsd_replan_task",
         "gsd_rework_brief_save",
@@ -355,7 +361,11 @@ export const UNIT_REGISTRY = {
     phaseChain: ["planning"],
     promptTemplate: "replan-task",
     toolContract: {
-      allowedGsdTools: ["gsd_replan_task", "gsd_decision_save"],
+      // `gsd_task_contract` is allowed but NOT required: `tool-contract.ts`
+      // derives `closeoutTools` by regex over `requiredWorkflowTools`, and
+      // `^gsd_task` would match this pure read -- making it stand in as the
+      // unit's completion signal. `complete-slice` lists it the same way.
+      allowedGsdTools: ["gsd_task_contract", "gsd_replan_task", "gsd_decision_save"],
       requiredWorkflowTools: ["gsd_replan_task"],
     },
   },

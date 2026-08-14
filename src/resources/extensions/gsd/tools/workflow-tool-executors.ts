@@ -2,6 +2,9 @@
 // File Purpose: Adapts shared GSD workflow handlers for MCP executor calls.
 
 import { ensureDbOpen } from "../bootstrap/dynamic-tools.js";
+// Same predicate `gsd_replan_task` validates with, so the read cannot disagree
+// with the write about which stored verify values are resendable.
+import { findGsdToolInvocationInVerify } from "../verification-gate.js";
 import { sanitizeCompleteMilestoneParams } from "../bootstrap/sanitize-complete-milestone.js";
 import { loadWriteGateSnapshot, shouldBlockContextArtifactSaveInSnapshot, shouldBlockRootArtifactSaveInSnapshot } from "../bootstrap/write-gate.js";
 import {
@@ -12,6 +15,8 @@ import {
   getSliceStatusSummary,
   getSliceTaskCounts,
   getTask,
+  getSlice,
+  getLifecycleShadowRepairCandidate,
   insertMilestone,
   insertAssessment,
   insertGateRun,
@@ -35,6 +40,7 @@ import { extractMilestoneSeq } from "../milestone-ids.js";
 import { readMilestoneMergeObservation } from "../db/milestone-closeout-readiness.js";
 import { immediateTransaction } from "../db/engine.js";
 import { isClosedStatus } from "../status-guards.js";
+import { normalizeLegacyLifecycleStatus } from "../db/lifecycle-shadow-comparison.js";
 import { GATE_REGISTRY } from "../gate-registry.js";
 import { generateRequirementsMd, saveArtifactToDb } from "../db-writer.js";
 import { clearPathCache, normalizeRealPath, relMilestoneFile, relSliceFile, relSlicePath, resolveGsdPathContract, resolveMilestoneFile, resolveSliceFile } from "../paths.js";
@@ -2201,6 +2207,300 @@ export async function executeReplanSlice(
       details: { operation: "replan_slice", error: msg },
     isError: true,
       };
+  }
+}
+
+/**
+ * The reasons `gsd_replan_task` would refuse a write, from state the read
+ * already has. Pure so every branch is testable without fixture archaeology:
+ * a real canonical lifecycle row needs a project_authority / workflow_operations
+ * FK chain, and an orphaned task needs foreign keys disabled.
+ *
+ * Mirrors `handleReplanTask`'s guards in the order it applies them: missing
+ * parent slice, closed parent slice, closed legacy task status, and the
+ * canonical lifecycle row -- which rejects `completed`/`cancelled`
+ * INDEPENDENTLY of the legacy column. When the two diverge (the drift the
+ * LifecycleShadowRepair machinery exists to detect) a legacy-only check reports
+ * "pending" and the write still bounces.
+ */
+export function describeReplanBlockers(input: {
+  legacyStatus: string;
+  canonicalStatus: string | null;
+  sliceStatus: string | null;
+  canonicalSliceStatus: string | null;
+  sliceMissing: boolean;
+}): string | null {
+  // `handleReplanTask` does not read the canonical row as-is: when none exists
+  // it ADOPTS `normalizeLegacyLifecycleStatus(status) ?? "ready"` and then
+  // rejects on that. Mirroring the adoption is what makes `deferred` work --
+  // it is absent from RAW_CLOSED_STATUSES, so `isClosedStatus` is false, but
+  // LEGACY_STATUS_MAP maps it to `cancelled` and the replan refuses. Checking a
+  // status list instead of the mapping would miss every such alias.
+  const effective = (canonical: string | null, legacy: string | null): string | null =>
+    canonical ?? (legacy === null ? null : normalizeLegacyLifecycleStatus(legacy) ?? "ready");
+  const isCanonicalClosed = (status: string | null): boolean =>
+    status === "completed" || status === "cancelled";
+
+  const effectiveTask = effective(input.canonicalStatus, input.legacyStatus);
+  const effectiveSlice = effective(input.canonicalSliceStatus, input.sliceStatus);
+  const legacyClosed = isClosedStatus(input.legacyStatus);
+  const canonicalClosed = isCanonicalClosed(effectiveTask);
+  const sliceClosed = (input.sliceStatus !== null && isClosedStatus(input.sliceStatus))
+    || isCanonicalClosed(effectiveSlice);
+  if (!legacyClosed && !canonicalClosed && !sliceClosed && !input.sliceMissing) return null;
+
+  return (input.sliceMissing
+    ? "The parent slice row is missing, and gsd_replan_task throws `missing parent slice` before any other check. "
+    : "")
+    + (sliceClosed
+      ? `gsd_replan_task refuses a task whose parent slice is "${input.sliceStatus ?? effectiveSlice}"`
+        + (input.sliceStatus !== null && !isClosedStatus(input.sliceStatus)
+          ? ` (canonical lifecycle "${effectiveSlice}")`
+          : "")
+        + "; call gsd_slice_reopen first. "
+      : "")
+    + (legacyClosed
+      ? `gsd_replan_task refuses this task while its status is "${input.legacyStatus}"; call gsd_task_reopen first. `
+      : "")
+    + (canonicalClosed && !legacyClosed
+      ? `The legacy status is "${input.legacyStatus}" but the canonical lifecycle status is "${effectiveTask}", and `
+        + "gsd_replan_task rejects on the canonical row independently. That divergence is drift; reopen the task or repair "
+        + "the shadow first. "
+      : "")
+    + "The contract above is accurate; the write is what is blocked.";
+}
+
+export interface TaskContractParams {
+  milestoneId: string;
+  sliceId: string;
+  taskId: string;
+}
+
+/**
+ * Read back the planning contract `gsd_replan_task` demands.
+ *
+ * `gsd_replan_task` requires the WHOLE contract to change one field, and before
+ * this tool nothing could read those values back: `gsd_query` returns STATE.md /
+ * PROJECT.md / requirements, and `gsd_milestone_status` never loads task rows at
+ * all (`getSliceTaskCounts` is a `COUNT(*)` aggregate with no `taskId`). So every
+ * single-field edit was a read-modify-write with no read, and the tool reports
+ * success whether or not the reconstructed fields match what was stored.
+ *
+ * Observed, not hypothetical: correcting one Verify command in a consumer
+ * project silently widened `expectedOutput` from one entry to two, because the
+ * caller reconstructed it from a naming convention.
+ *
+ * Field names mirror the `gsd_replan_task` PARAMETERS (camelCase), not the
+ * `TaskRow` columns (snake_case), so the round trip is copy-paste rather than
+ * interpretation. `unresendableFields` names the exceptions, so "resend what you
+ * did not change" is safe advice for everything it does not list.
+ *
+ * Two further fields are reported with an explicit caveat rather than omitted,
+ * because silently dropping them recreates the same guessing one layer down:
+ *
+ * - `targetRepositories` is NOT resendable on any agent-reachable surface.
+ *   `resolveEffectiveTargetRepositories` (`plan-task.ts`) does return a
+ *   caller-supplied value first, but neither replan tool schema exposes the
+ *   parameter -- not the MCP one and not the in-process one in `db-tools.ts`
+ *   (only `gsd_plan_task` / `gsd_plan_slice` accept it). Only a direct
+ *   TypeScript caller of `handleReplanTask` can supply it. So every replan
+ *   re-resolves: parent slice targets, then targets derived from
+ *   `files + expectedOutput`, then the default -- and a task deliberately
+ *   NARROWED below its slice widens back, losing the narrowing. That is the same
+ *   silent-widening class this tool exists to prevent, so the caveat says to
+ *   record and re-check rather than to ignore.
+ * - `fullPlanMd` is accepted by `handleReplanTask` but by NEITHER replan tool
+ *   schema -- not the MCP one and not the in-process one in `db-tools.ts` -- so
+ *   only a direct TypeScript caller can send it back. It survives a replan
+ *   regardless, because `upsertTaskPlanning` COALESCEs the column. Only its
+ *   PRESENCE is actionable here, and
+ *   the column is unbounded (legacy imports populate it wholesale), so the
+ *   response carries a flag and a length rather than the document -- which
+ *   would otherwise ship twice per call, in `content[0].text` and again in
+ *   `structuredContent`. A present authored plan means the rendered PLAN.md
+ *   bypasses the per-task renderer and can be STALE after a replan, so the
+ *   reader needs to know before trusting PLAN.md over this response.
+ */
+export async function executeTaskContract(
+  params: TaskContractParams,
+  basePath: string = process.cwd(),
+): Promise<ToolExecutionResult> {
+  try {
+    const dbAvailable = await ensureDbOpen(basePath);
+    if (!dbAvailable) {
+      return {
+        content: [{ type: "text" as const, text: "Error: GSD database is not available. Cannot read the task contract." }],
+        details: { operation: "task_contract", error: "db_unavailable" },
+        isError: true,
+      };
+    }
+
+    const task = getTask(params.milestoneId, params.sliceId, params.taskId);
+    if (!task) {
+      // Fail closed rather than returning an empty contract: a caller that wrote
+      // an empty contract straight back to gsd_replan_task would wipe the row.
+      const missing = `${params.milestoneId}/${params.sliceId}/${params.taskId}`;
+      return {
+        content: [{ type: "text" as const, text: `Error: task ${missing} was not found.` }],
+        details: { operation: "task_contract", error: "not_found", task: missing },
+        isError: true,
+      };
+    }
+
+    // Fields a caller must NOT blindly resend, because `gsd_replan_task` would
+    // reject them and bounce the caller back into inventing values -- the exact
+    // failure this tool exists to prevent. Two independent causes:
+    //
+    // 1. Stored empty. `validateParams` (`replan-task.ts`) requires a non-blank
+    //    title/description/estimate/verify, but rows routinely store them
+    //    blank: `complete-task.ts` synthesizes a row for a task completed with
+    //    no plan, `insertTask` defaults every planning column, and legacy
+    //    imports do the same.
+    // 2. A `verify` naming a GSD tool. `assertVerifyIsShellCheckable` gates
+    //    only `gsd_plan_task` and `gsd_replan_task` -- `gsd_plan_slice` /
+    //    `gsd_replan_slice` and legacy imports do not -- so a slice-planned task
+    //    can hold a verify that this tool's own "resend verbatim" instruction
+    //    would make the replan reject.
+    const unresendableFields: Array<{ field: string; reason: string }> = [];
+    for (const [field, value] of [
+      ["title", task.title],
+      ["description", task.description],
+      ["estimate", task.estimate],
+      ["verify", task.verify],
+    ] as const) {
+      if (value.trim().length === 0) {
+        unresendableFields.push({
+          field,
+          reason: `Stored empty; gsd_replan_task rejects a blank ${field}. Supply a real value deliberately rather than treating the stored blank as the contract.`,
+        });
+      }
+    }
+    const toolVerifyLine = findGsdToolInvocationInVerify(task.verify);
+    if (toolVerifyLine) {
+      unresendableFields.push({
+        field: "verify",
+        reason: `Names a GSD tool (${JSON.stringify(toolVerifyLine)}); gsd_replan_task requires a shell-checkable command. `
+          + "Replace it with a shell command, or describe the tool-verified outcome as prose.",
+      });
+    }
+
+    // 3. A blank entry INSIDE an array. `validateStringArray` rejects any
+    //    element failing `isNonEmptyString`, but nothing enforces that on the
+    //    way in: `gsd_replan_slice` types these as plain string arrays on both
+    //    transports, its `validateParams` checks only taskId/title per updated
+    //    task, and `upsertTaskPlanning` stores the elements verbatim. So a
+    //    slice-replanned task can hold `expectedOutput: ["", "out.ts"]`, which
+    //    this response would otherwise declare safe to resend.
+    for (const [field, values] of [
+      ["files", task.files],
+      ["inputs", task.inputs],
+      ["expectedOutput", task.expected_output],
+    ] as const) {
+      const blankCount = values.filter((value) => value.trim().length === 0).length;
+      if (blankCount > 0) {
+        unresendableFields.push({
+          field,
+          reason: `Contains ${blankCount} blank ${blankCount === 1 ? "entry" : "entries"}; gsd_replan_task rejects the whole array with `
+            + `"${field} must contain only non-empty strings". Drop the blanks or replace them deliberately.`,
+        });
+      }
+    }
+
+    // `.trim()`, matching `markdown-renderer.ts`'s own condition for bypassing
+    // the per-task renderer. A whitespace-only body is storable, and a bare
+    // length check would warn about staleness the renderer cannot produce.
+    const authoredPlan = task.full_plan_md.trim().length > 0;
+
+    // `handleReplanTask` refuses a closed/completed/cancelled task and a closed
+    // parent slice before it looks at the contract at all, so a clean payload
+    // with an empty `unresendableFields` could still be unwritable. Report the
+    // statuses so the read fails early in the same spirit as its not-found
+    // guard, rather than setting up a write that bounces.
+    // BOTH gates must be reported, because `handleReplanTask` checks both: the
+    // legacy hierarchy column (`isClosedStatus(task.status)`) AND the canonical
+    // lifecycle row, which rejects `completed`/`cancelled` independently. When
+    // the two diverge -- exactly the drift the LifecycleShadowRepair machinery
+    // exists to detect -- reading only the legacy column reports "pending" and
+    // the write still bounces with the error this caveat promises to pre-empt.
+    const parentSlice = getSlice(params.milestoneId, params.sliceId);
+    const canonicalStatus = getLifecycleShadowRepairCandidate({
+      itemKind: "task",
+      milestoneId: params.milestoneId,
+      sliceId: params.sliceId,
+      taskId: params.taskId,
+    })?.canonicalStatus ?? null;
+    // The slice gets the SAME two-source treatment as the task: `handleReplanTask`
+    // applies its canonical completed/cancelled guard to the parent slice too,
+    // independently of the slice's legacy column.
+    const canonicalSliceStatus = parentSlice
+      ? getLifecycleShadowRepairCandidate({
+        itemKind: "slice",
+        milestoneId: params.milestoneId,
+        sliceId: params.sliceId,
+      })?.canonicalStatus ?? null
+      : null;
+    const replanBlockers = describeReplanBlockers({
+      legacyStatus: task.status,
+      canonicalStatus,
+      sliceStatus: parentSlice?.status ?? null,
+      canonicalSliceStatus,
+      sliceMissing: parentSlice === null,
+    });
+
+    const result = {
+      milestoneId: params.milestoneId,
+      sliceId: params.sliceId,
+      taskId: params.taskId,
+      status: task.status,
+      canonicalStatus,
+      sliceStatus: parentSlice?.status ?? null,
+      canonicalSliceStatus,
+      title: task.title,
+      description: task.description,
+      estimate: task.estimate,
+      files: task.files,
+      verify: task.verify,
+      inputs: task.inputs,
+      expectedOutput: task.expected_output,
+      targetRepositories: task.target_repositories ?? [],
+      fullPlanMdPresent: authoredPlan,
+      fullPlanMdLength: task.full_plan_md.length,
+      unresendableFields,
+      caveats: {
+        targetRepositories:
+          "NOT resendable through either replan tool: no gsd_replan_task schema accepts targetRepositories, in-process or over MCP. "
+          + "Every replan re-resolves it (parent slice targets, then targets derived from files + expectedOutput, then the default), "
+          + "so a task narrowed below its slice widens back to the slice's targets and the narrowing is lost. "
+          + "Record this value before replanning and check it afterwards. There is no supported way to restore a lost narrowing "
+          + "through a replan: no replan schema carries targetRepositories, and gsd_plan_task -- which does -- is NOT a safe "
+          + "destination for this contract (it blanks observabilityImpact, which is not returned here, and applies path-only "
+          + "validation that gsd_replan_task does not). Report the widening rather than attempting to repair it.",
+        fullPlanMd: authoredPlan
+          ? "Not a gsd_replan_task parameter, and omitted here because it is unbounded. This task HAS an authored plan, so its rendered PLAN.md bypasses the per-task renderer and can be stale after a replan -- trust this response over PLAN.md."
+          : "Not a gsd_replan_task parameter. This task has no authored plan.",
+        ...(unresendableFields.length > 0
+          ? {
+            unresendableFields:
+              "These fields cannot be resent verbatim to gsd_replan_task; each entry says why. "
+              + "Everything not listed here is safe to resend exactly as returned.",
+          }
+          : {}),
+        ...(replanBlockers ? { status: replanBlockers } : {}),
+      },
+    };
+
+    return {
+      content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
+      details: { operation: "task_contract", ...result },
+    };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logWarning("tool", `gsd_task_contract tool failed: ${msg}`);
+    return {
+      content: [{ type: "text" as const, text: `Error reading task contract: ${msg}` }],
+      details: { operation: "task_contract", error: msg },
+      isError: true,
+    };
   }
 }
 

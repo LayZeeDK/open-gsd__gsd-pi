@@ -161,6 +161,32 @@ export function registerQueryTools(
   });
 
   pi.registerTool({
+    name: "gsd_task_contract",
+    label: "Task Planning Contract",
+    description:
+      "Read back the exact planning contract `gsd_replan_task` requires for one task: " +
+      "title, description, estimate, files, verify, inputs, and expectedOutput. " +
+      "`gsd_replan_task` demands the WHOLE contract to change one field, so call this first " +
+      "and resend the untouched fields verbatim. Reconstructing them from a naming convention " +
+      "silently rewrites plan data and the replan still reports success. " +
+      "Also reports `targetRepositories` and whether the task has an authored plan; see the `caveats` field before resending either.",
+    promptSnippet: "Read one task's stored planning contract before calling gsd_replan_task",
+    promptGuidelines: [
+      "Call gsd_task_contract before gsd_replan_task and resend every field you are not deliberately changing.",
+      "Never reconstruct inputs/expectedOutput from a naming convention -- read them.",
+    ],
+    parameters: Type.Object({
+      milestoneId: Type.String({ description: "Milestone ID (e.g. M001)" }),
+      sliceId: Type.String({ description: "Slice ID (e.g. S01)" }),
+      taskId: Type.String({ description: "Task ID (e.g. T01)" }),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const { executeTaskContract } = await import("../tools/workflow-tool-executors.js");
+      return executeTaskContract(params, resolveCtxCwd(ctx));
+    },
+  });
+
+  pi.registerTool({
     name: "gsd_checkpoint_db",
     label: "Checkpoint GSD Database",
     description:
