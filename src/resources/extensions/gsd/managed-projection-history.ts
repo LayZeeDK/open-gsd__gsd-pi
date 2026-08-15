@@ -216,6 +216,23 @@ function openManagedProjectionRoot(targetRoot: string): ProjectionRootIdentityLo
   );
 }
 
+/**
+ * Windows codes that mean "someone else was holding this file for a moment",
+ * matched on the `os error N` token rather than the prose beside it: the
+ * human-readable half is OS-localized, so an English substring would silently
+ * never match on a non-English host -- the same class of bug as the race itself.
+ *
+ * 32 `ERROR_SHARING_VIOLATION`, 5 `ERROR_ACCESS_DENIED` (a delete-pending file),
+ * 183 `ERROR_ALREADY_EXISTS` (most likely a rename colliding; a `create_new`
+ * open of an existing file yields 80, not 183).
+ *
+ * `(?![0-9])` is load-bearing on every code: a bare `os error 5` also matches
+ * `os error 53` (`ERROR_BAD_NETPATH`), `55` and `59`, `os error 183` matches
+ * `os error 1832`, and `os error 32` matches `321`.
+ */
+const TRANSIENT_PROJECTION_ROOT_LOCK_RE =
+  /\bEBUSY\b|sharing violation|os error (?:5|32|183)(?![0-9])|projection root is busy/iu;
+
 function isTransientProjectionRootLockError(error: unknown): boolean {
   const seen = new Set<unknown>();
   let current = error;
@@ -224,7 +241,7 @@ function isTransientProjectionRootLockError(error: unknown): boolean {
     const candidate = current as { code?: unknown; message?: unknown; cause?: unknown };
     if (candidate.code === "EBUSY") return true;
     if (typeof candidate.message === "string"
-      && /\bEBUSY\b|sharing violation|os error 32|projection root is busy/iu.test(candidate.message)) {
+      && TRANSIENT_PROJECTION_ROOT_LOCK_RE.test(candidate.message)) {
       return true;
     }
     current = candidate.cause;
@@ -254,6 +271,13 @@ export function _openManagedProjectionRootWithRetryForTest<T>(
   wait: (delayMs: number) => void,
 ): T {
   return openManagedProjectionRootWithRetry(open, wait);
+}
+
+export function _persistMutationForTest(
+  handle: Pick<ProjectionRootIdentityLock, "writeFile">,
+  mutation: { journalPath: string },
+): void {
+  persistMutation(handle as ProjectionRootIdentityLock, mutation as PersistedManagedProjectionMutation);
 }
 
 function withManagedProjectionRoot<T>(
@@ -1043,10 +1067,28 @@ function validateMutation(value: unknown, targetRoot: string, path: string): Per
   };
 }
 
+/**
+ * Called from 21 sites over the same few filenames -- six times in one real
+ * write flow -- so a projection write is a burst of create/rename/delete on one
+ * logical path, and anything holding a freshly created file for a few
+ * milliseconds lands inside it. The retry absorbs that.
+ *
+ * Safe to retry because the native publication reclaims its own leftovers:
+ * `write_windows_file` runs `recover_windows_control_publication` at the head of
+ * every call, so an attempt is the same path a process restart would take. A
+ * leftover it cannot reconcile surfaces as "control publication intents
+ * conflict", which is not transient-shaped and so is not retried.
+ *
+ * What makes recovery treat a re-attempt as a resumption rather than a
+ * conflicting write is that every attempt presents the same path and the same
+ * bytes. Both derive from `mutation`, which the retry does not touch, so keep
+ * any future work that varies per attempt out of the closure.
+ */
 function persistMutation(handle: ProjectionRootIdentityLock, mutation: PersistedManagedProjectionMutation): void {
   const path = `${JOURNAL_LOGICAL_ROOT}/${basename(mutation.journalPath)}`;
   const { journalPath: _journalPath, targetRoot: _targetRoot, ...persisted } = mutation;
-  handle.writeFile(path, Buffer.from(`${JSON.stringify(persisted)}\n`));
+  const content = Buffer.from(`${JSON.stringify(persisted)}\n`);
+  openManagedProjectionRootWithRetry(() => handle.writeFile(path, content));
 }
 
 function removePlaceholder(
