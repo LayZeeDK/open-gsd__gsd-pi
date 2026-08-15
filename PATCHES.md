@@ -58,6 +58,8 @@ Full build, link and rebase procedure: **[FORK.md](FORK.md)**.
 | 23 | `9e07c897` | an interactive submit that loses the streaming race | not filed |
 | 24 | `ddf5adf7` | read back the task contract `gsd_replan_task` demands | not filed |
 | 25 | `a9f89297` | answer tool calls an aborted tool batch leaves unresolved | not filed |
+| 26 | `3f50b6a9` | a failure-context fence that swallows the retry prompt | not filed |
+| 27 | `344cb25c` | a Windows control-file race is retried where it happens | not filed |
 
 Patch 8 spans **two** commits: `d44f1275` (`test(mcp-server): pin elicitation
 behaviour across client capability shapes`) lands `elicitation-capability.test.ts`
@@ -1191,6 +1193,174 @@ nothing, and a green suite is not evidence that the mechanism is pinned.
 
 ---
 
+### 26. A failure-context fence that swallows the retry prompt
+
+`formatFailureContext` (`verification-gate.ts`) builds fenced markdown blocks
+that `auto/unit-phase.ts` injects into a verification-retry prompt, appending
+`\n\n---\n\n${finalPrompt}` after them. A code fence left open swallows the
+instructions the retry exists to deliver: they reach the model as inert code
+inside a block. **Three** independent ways it was left open, all pre-existing.
+
+**A fence in the check's own output.** Blocks used exactly three backticks, so a
+fence in the output -- a markdown linter, a doc test echoing a snippet, a
+formatter over `.md` -- closed the block early, the rest leaked as prose, and the
+block's own closing delimiter OPENED a new one. Fixed by sizing each delimiter
+past the longest backtick run in the output, the standard fenced-block rule.
+
+**A newline in `check.command`.** A `###` heading is one line. Measured, 3 of 6
+command shapes escaped the block this way. Not theoretical: `discoverCommands`
+splits and validates task-plan verify lines, but preference commands are neither
+split nor validated (`verification-gate.ts:228-234`), and "prose executed as a
+shell command" is a documented GSD failure mode. Fixed by flattening whitespace
+in the heading, which repairs the broken heading at the same time.
+
+**The total cap slicing mid-block.** `MAX_FAILURE_CONTEXT_CHARS` sliced the
+joined body at a character offset, which lands anywhere. The cap is now spent per
+block while assembling, so the body ends at a block boundary.
+
+**Block-granular capping regresses the cap to unbounded on its own**, which is
+why two companions are not optional. The first block is kept unconditionally so
+at least one failure survives, and `check.command` was itself unbounded -- a
+failing `node -e "<40 KB script>"` produced a measured 40,196-char body against a
+10,000 cap, because the per-check cap covers the OUTPUT, not the command. So the
+command is bounded too, cut on code points (the sibling `truncate` cuts on
+character boundaries for the same reason and cannot be reused: its marker carries
+a newline, which a heading cannot). The old hard slice stays as a backstop.
+
+**The backstop is unreachable, and the invariant that keeps it so is recorded on
+the constant.** Measured worst single block: **6,383** chars against the 10,000
+cap, peaking at 2,034 backticks of stderr -- the largest input `truncate` still
+returns unchanged. The intuitive `output + command + overhead` formula gives
+2,460, a **3x** underestimate, because `fenceFor` sizes each delimiter past the
+output's longest backtick run and emits it twice. That matters: a maintainer
+raising `MAX_FAILURE_OUTPUT_PER_CHECK` on the naive reading would see 3,000 as
+obviously safe when the true worst becomes ~9,300, and 3,300 would take the
+backstop live silently. The docblock on `MAX_FAILURE_CONTEXT_CHARS` now carries
+the real formula and names the OUTPUT cap -- not the command cap -- as the term
+that sizes the delimiter line.
+
+**Counting fences to balance them was tried inside patch 22 and withdrawn.**
+Backtick-run parity cannot distinguish this function's own delimiters from a
+fence inside a check's output, so one stray content fence flips the parity and a
+body that really does end mid-block reads as closed -- defeating the guard in
+exactly the case it exists for.
+
+**Tests** (6 in `verification-gate.test.ts`) assert balance by *rendering shape*,
+via a `fencesBalanced` helper following the CommonMark closing rule, rather than
+by counting -- a check's own fences legitimately appear. Every production hunk
+reddens exactly one test. Two traps worth naming:
+
+- **The block-boundary test needed a per-check end marker to bite at all.** With
+  uniform filler a mid-block slice leaves no trace, and the backstop's re-close
+  hides it from a balance check. Written without the marker, it passed with the
+  per-block cap deleted.
+- **"an under-cap body is returned unchanged" survives every mutation** of this
+  patch's hunks. It is a golden characterization pin, not a fifth mutation check;
+  what it does catch is the `Math.max(3, ...)` floor in `fenceFor`.
+
+---
+
+### 27. A Windows control-file race is retried where it happens
+
+A projection write publishes a control file through a Windows-safe dance -- write
+`.intent.prepared`, rename to `.intent`, swap the target, clean up. The module
+calls `persistMutation` from 21 sites, six times in one real write flow, always
+over the same few filenames, so a single write is a burst of
+create/rename/delete on one logical path. Anything holding a freshly created file
+for a few milliseconds -- real-time antivirus on a scanned volume -- lands inside
+that burst and escapes as a hard failure that can wedge a Task completion.
+`gsd-recover-aborted-task` lists the resulting
+`Task completion PLAN projection failed: native projection root identity locking failed`
+among the stuck states operators hit.
+
+Two codes observed, both on `.json.intent`: **5** `ERROR_ACCESS_DENIED` (a
+delete-pending file) and **183** `ERROR_ALREADY_EXISTS`. The 183 mechanism is
+**not** established -- a Rust `create_new` open of an existing file yields
+`ERROR_FILE_EXISTS` (80), so the obvious "CREATE_NEW found a leftover" story is
+probably wrong. The fix depends on neither story, which is why it matches no
+paths.
+
+**Retry, do not reclassify.** The race is millisecond-scale and the module
+already has a bounded `[5,10,20,40]` ms ladder sized for it. Routing it to the
+Task recovery budget instead would re-dispatch the entire Task at model cost, up
+to twice, to absorb a file race -- and would have widened the wrong predicate.
+There are two: `isTransientProjectionLockError` (`projection-root-errors.ts`)
+drives the recovery classifier, `isTransientProjectionRootLockError` drives the
+in-process ladder. Only the second is widened. The classifier is the backstop for
+failures that survive the retry and deserves its own decision.
+
+**The ladder covered one acquisition and no writes.** `withManagedProjectionRoot`
+calls `openManagedProjectionRoot` bare; exactly 1 of 11 acquisition sites goes
+through the ladder, and nothing covered a write made while the lock is already
+HELD -- which is what the observed failure is. So the wrap is added at
+`persistMutation`, the only site observed failing.
+
+**Placement replaces pattern-matching.** At the call site we already know we are
+inside the control-file dance, so the predicate never has to answer "is this
+error ours" -- which it could not: `rename_windows_handle`,
+`delete_windows_handle`, `sync_windows_control_parent` and the writes in
+`write_windows_control_intent` all map through `projection_error` with no path, so
+a message-scoped rule would refuse the same race landing one syscall over and
+present as "fixed but still flaky".
+
+**Safe to retry, verified against the Rust rather than assumed.**
+`write_windows_file` runs `recover_windows_control_publication` at the head of
+every call (`projection_root_identity_lock.rs:1715`), so an attempt takes the
+same path a process restart would. A leftover it cannot reconcile surfaces as
+`control publication intents conflict`, which is not transient-shaped and so is
+not retried.
+
+Two details in the predicate:
+
+- **Match the `os error N` token, never the prose.** The human-readable half is
+  OS-localized; the captured failures are Danish. An English substring would pass
+  a test on an English host and never match in production on this one -- the same
+  class of bug as the one being fixed.
+- **`(?![0-9])` on every code.** A bare `os error 5` also matches `os error 53`
+  (`ERROR_BAD_NETPATH`), `55` and `59`; `os error 183` matches `1832`; the
+  pre-existing `os error 32` clause had the same latent hazard against `321`.
+
+**Known limits, recorded so the next rebase does not rediscover them:**
+
+- **Sibling `handle.removeFile` calls are unwrapped.** They run the same recovery
+  head over the same `.gsd-control-*` filenames in the same burst. Recurrence one
+  syscall over is the predicted outcome, not a surprise; this is a scope decision
+  on the evidence, not a claim they are safe.
+- **The retry multiplies exposure to a pre-existing permanent-wedge window.**
+  `encode_windows_control_intent` hardcodes `sequence: 1`, and a failure landing
+  between the second prepared-intent write and the current intent's deletion
+  leaves both at sequence 1, which recovery rejects forever as
+  `control publication intents conflict`. Not a regression -- a process restart
+  wedges identically -- but five attempts means up to five passes through it, and
+  the operator-visible error text changes from `os error 5` to the conflict
+  message.
+- **Cost is per retried operation, not per failure.** A recovery pass calls
+  `persistMutation` once per stale journal entry, so a genuinely denied directory
+  with N entries costs a multiple of ~75 ms, synchronously, since the default
+  `wait` is `Atomics.wait` on the main thread.
+- **Not Windows-only.** Rust renders errno the same way everywhere, so
+  `os error 5` is `EIO` on Linux/macOS and a real I/O error there now retries four
+  times before surfacing.
+- **Two predicates now disagree about code 5**, with upstream tests pinning the
+  other side. See FORK.md's acceptance list, which carries
+  `projection-root-errors.test.ts` and `runtime-invariant-modules.test.ts` for
+  exactly this reason.
+
+**Tests** (7 in `managed-projection-root-retry.test.ts`), each mutation-checked.
+`os error 32` needed a **constructed** fixture to be pinned at all: the captured
+messages for it also carry the English "sharing violation" token, which the
+predicate matches on its own, so the numeric branch for the code this ladder was
+originally built for was otherwise dead. Deliberately **not** asserted: that every
+attempt writes identical bytes -- `path` and `content` are consts pushed by
+reference, so any such check compares a value to itself and holds even if they
+were recomputed. The property is real and load-bearing, but structural; a test
+that cannot fail is worse than no test.
+
+**The flaky suite is not an acceptance test for this patch.**
+`custom-task-host-verification.test.ts` fails roughly one run in three, so neither
+a green run nor a red one proves anything. FORK.md's claim that it was "all clean"
+is corrected in the same pass.
+
 ## The SDK bump 0.2.83 -> 0.3.229
 
 Not a patch: a fork-local dependency decision, so it is listed separately and is
@@ -1583,6 +1753,48 @@ porting. B3, B4 and B7 were each re-confirmed still open at **v1.15.0**:
   kill. The most dangerous item on the list and the least suited to being rushed
   in behind four others. **Citation corrected at the v1.15.0 rebase** -- earlier
   editions cited `commands-maintenance.ts`, which now only re-exports it.
+**Planned, then withdrawn or blocked (2026-08-15):**
+
+- **Steering never reaches a running query** -- a message typed mid-unit surfaces
+  only when the unit ends. `stream-adapter.ts` calls the Agent SDK's `query()`
+  once per GSD unit, and `buildSdkQueryPrompt` hands it either a plain string or
+  an iterable that yields one message and completes, so there is no open input
+  channel for the whole unit.
+
+  **The mechanism was measured on 2026-08-15 and it works.** Driving `query()` in
+  streaming-input mode against the SDK's own binary with a five-tool prompt, a
+  message pushed during the first tool call was delivered and acted on after that
+  single tool round -- the remaining four never ran. So a multi-tool GSD unit is
+  **not** one long CLI turn, and steering latency would drop from one unit to one
+  tool round without touching `interrupt()`. A second run with
+  `priority: 'now'` (declared on `SDKUserMessage` with no doc comment) was a
+  warning rather than a feature: the message was never delivered, the query
+  returned after the first tool result having emitted no text, and the work was
+  abandoned. Do not set `priority`.
+
+  **Blocked on a design decision, not on evidence.** There is no seam to route the
+  steer through. `queueSteer` reaches `agent.steer()` in `gsd-agent-core`; the
+  queue is drained by `getSteeringMessages`, an `AgentLoopConfig` callback the
+  loop never passes to the provider; and `StreamFunction` is
+  `(model, context, options?)`, so `streamViaClaudeCode` cannot see it. Closing
+  that needs either a module-level push registry in the extension (making a
+  *package* depend on an *extension*, with no precedent -- the one existing
+  module-global of that shape is called only from the extension's own `index.ts`)
+  or widening the provider contract in `pi-ai` (a permanent fork delta on three
+  rebase-sensitive surfaces instead of one). A partial patch is not an option: an
+  input iterable held open that nothing pushes to is the design's main stated risk
+  with none of the benefit. Full record in the plan file.
+
+- **Plumbing the failure text into the durable recovery record** -- WITHDRAWN
+  before implementation. Three review rounds each falsified a premise it was built
+  on: the `replan-task` prompt it was written for is unreachable by construction,
+  and the `remediate` re-dispatch it was re-aimed at *already* carries the failing
+  command and output via `auto/unit-phase.ts`. The residual scope is the
+  `abort` -> `resume` path and four rarer ones, against a patch that touches three
+  files, adds a `LEFT JOIN` to a hot query, and moves up to ~10 KB of unbudgeted
+  text into every recovery dispatch. Poor trade. Two corrections it established
+  are kept in plan 049's record.
+
 **Investigated and CLOSED -- not a defect:**
 
 - **B8 -- `renderPlanProjection` writes a different, unstamped document.**

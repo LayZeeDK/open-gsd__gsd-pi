@@ -442,7 +442,10 @@ node --import ./src/resources/extensions/gsd/tests/resolve-ts.mjs \
      src/resources/extensions/gsd/tests/task-recovery-relaunch.test.ts \
      src/resources/extensions/gsd/tests/evidence-cross-ref.test.ts \
      src/resources/extensions/gsd/tests/task-contract-tool.test.ts \
-     src/resources/extensions/gsd/tests/session-forensics-aborted-filter.test.ts
+     src/resources/extensions/gsd/tests/session-forensics-aborted-filter.test.ts \
+     src/resources/extensions/gsd/tests/managed-projection-root-retry.test.ts \
+     src/resources/extensions/gsd/tests/projection-root-errors.test.ts \
+     src/resources/extensions/gsd/tests/runtime-invariant-modules.test.ts
 ```
 
 > The line before `evidence-cross-ref.test.ts` carried a literal \n instead of a
@@ -451,6 +454,22 @@ node --import ./src/resources/extensions/gsd/tests/resolve-ts.mjs \
 >
 > `task-contract-tool.test.ts` arrived with patch 24 and
 > `session-forensics-aborted-filter.test.ts` with patch 25.
+>
+> The last three arrived with patch 27, and only the first is the fork's own.
+> Patch 27 widens `isTransientProjectionRootLockError` to treat `os error 5` and
+> `os error 183` as transient, while the sibling `isTransientProjectionLockError`
+> in `projection-root-errors.ts` deliberately does **not** -- it is the backstop
+> for failures that survive the in-process retry. So the tree now carries two
+> predicates that disagree about code 5, with upstream tests pinning the other
+> side (`projection-root-errors.test.ts:29-34`, and
+> `runtime-invariant-modules.test.ts:250` mapping `os error 32` to
+> `projection-lock-transient`). Per
+> [When a patch redefines a shared value](#when-a-patch-redefines-a-shared-value),
+> those upstream suites belong on the list: if a future rebase brings an upstream
+> widening of the classifier, it will merge clean and silently double-retry.
+>
+> Patch 26 has no suite of its own -- its cases live in `verification-gate.test.ts`,
+> which the list does not carry. Run it after any change to `formatFailureContext`.
 
 Patch 25 also lands tests in `packages/pi-agent-core`, which **no gate in this
 repo runs**: `run-package-tests.cjs` walks only `dist-test/packages/*/src`,
@@ -477,8 +496,19 @@ pnpm --filter @gsd/pi-agent-core exec vitest --run test/agent-loop.test.ts
 >
 > Also worth running after any change to this family, though not on the list:
 > `auto-loop.test.ts` (121 of 129 on this host, identical clean and patched),
-> `auto-task-execution-cutover.test.ts`, `auto-verification.test.ts` and
-> `custom-task-host-verification.test.ts` (all clean).
+> `auto-task-execution-cutover.test.ts` and `auto-verification.test.ts` (clean).
+>
+> **`custom-task-host-verification.test.ts` was listed here as "all clean" and is
+> not.** It fails roughly one run in three on this host -- four consecutive solo
+> runs gave 1, 1, 1, 0 failing cases, a *different* case each time, and 1, 2, 1
+> with the tree reverted a commit, so it predates the fork. Every failure was the
+> same operation: a native control-file publication under
+> `.gsd/migration/projection-mutations/`, with Windows `os error 5` or
+> `os error 183`. Patch 27 addresses the product defect behind it. The suite is
+> still **not** an acceptance test for anything -- at that failure rate neither a
+> green run nor a red one proves much -- so judge patch 27 on
+> `managed-projection-root-retry.test.ts` and treat this suite as a long-run
+> observation over at least 10 runs.
 
 Patch 15 also lands a case in the `claude-code-cli` tree, which the
 `resolve-ts.mjs` hook resolves fine despite shipping under `gsd/tests/`:
@@ -585,7 +615,20 @@ rebase; no figure is carried forward from the v1.14.0 edition.
 
 ### Per-patch acceptance suites
 
-The 19-suite list runs **418** cases. Over four consecutive runs with no code
+**Re-measured 2026-08-15 at patch 27: the list is now 30 suites and runs 648
+cases, of which 644 passed and 2 failed** (the deterministic `chmodSync`
+ROADMAP-divergence test named below, and the pre-existing `plan-slice artifact
+resolution handles lowercase unit IDs against uppercase paths`). No new failure
+was introduced by patches 26 or 27.
+
+> **Do not reconcile 648 against either older figure.** The 418 below was
+> measured on the 19-suite list; a later session recorded "348 of 355" for a
+> 27-suite list, which cannot be right -- adding suites cannot reduce the count,
+> so that measurement was taken against something other than the command as
+> written. Both are left in place as history rather than folded into an
+> arithmetic that would be fiction. Re-measure rather than deriving.
+
+The 19-suite list ran **418** cases. Over four consecutive runs with no code
 change: **417 / 414 / 414 / 415**, i.e. 1 to 4 failures varying with nothing but
 the run.
 
