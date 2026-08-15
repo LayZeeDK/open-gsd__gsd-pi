@@ -14,6 +14,7 @@ import type {
 	AssistantMessageEvent,
 	AssistantMessageEventStream,
 	Context,
+	Message,
 	Model,
 	SimpleStreamOptions,
 	ThinkingLevel,
@@ -123,6 +124,26 @@ interface ClaudeCodeStreamOptions extends SimpleStreamOptions {
 		options?: Record<string, unknown>;
 	}) => AsyncIterable<SDKMessage>;
 	_skipWorkflowMcpPreflightForTest?: boolean;
+	/**
+	 * Drains the agent's steering queue. NOT declared on `SimpleStreamOptions`,
+	 * but present at runtime: `agent-loop.ts` spreads the whole `AgentLoopConfig`
+	 * into the options it hands the provider, and `getSteeringMessages` is a
+	 * member of it. Declared here so the adapter can consume it without widening
+	 * an upstream contract.
+	 *
+	 * Draining here rather than peeking is what keeps delivery AT-MOST-once: this
+	 * is the same authoritative queue the agent loop drains between provider
+	 * calls, so a message taken here is not taken again there. At-most, not
+	 * exactly: a steer drained on an iteration that then aborts or ends the turn
+	 * is gone -- see this patch's record for the windows that remain.
+	 *
+	 * If upstream ever stops spreading, this reads `undefined`, the drain is
+	 * skipped and steering silently reverts to the pre-patch behaviour. No type
+	 * error, and no test here would catch it -- the wiring tests inject the
+	 * callback directly rather than routing through `agent-loop.ts`. It fails
+	 * SAFE, which is what makes the bet acceptable.
+	 */
+	getSteeringMessages?: () => Promise<Message[]>;
 }
 
 export function serverToolUseToToolCallLike(block: {
@@ -646,30 +667,147 @@ export function extractImageBlocksFromContext(context: Context): SDKInputImageBl
 	return imageBlocks;
 }
 
-/** Build the SDK query prompt, wrapping image blocks into an async iterable user message when present. */
-export function buildSdkQueryPrompt(
+/** The one message a query opens with: the prompt text, plus any image blocks. */
+export function buildSdkQueryMessage(
 	context: Context,
 	textPrompt: string = buildPromptFromContext(context),
-): string | AsyncIterable<SDKInputUserMessage> {
+): SDKInputUserMessage {
 	const imageBlocks = extractImageBlocksFromContext(context);
-	if (imageBlocks.length === 0) {
-		return textPrompt;
-	}
-
 	const content: SDKInputUserContentBlock[] = [...imageBlocks];
-	if (textPrompt) {
+	// The second clause keeps `content` from being empty when there is neither
+	// text nor an image. Degenerate either way, and rejected downstream either
+	// way, but an empty content array is the worse shape to hand the SDK.
+	if (textPrompt || imageBlocks.length === 0) {
 		content.push({ type: "text", text: textPrompt });
 	}
 
-	const sdkMessage: SDKInputUserMessage = {
+	return {
 		type: "user",
 		message: { role: "user", content },
 		parent_tool_use_id: null,
 	};
+}
+
+/**
+ * The SDK content blocks for a steering message, or [] when it carries none.
+ *
+ * `content` is a string or a block list depending on how the steer was queued,
+ * and the seam it arrives through is typed `AgentMessage[]` -- an
+ * interface-merging extension point, not a closed union -- so a shape neither
+ * branch expects is possible and must not throw.
+ *
+ * Images are carried through rather than dropped. `queueSteer` accepts them and
+ * the RPC mode passes them, and because the message is DRAINED here it never
+ * reaches the agent loop either -- dropping them would lose them outright rather
+ * than defer them.
+ */
+export function steeringMessageContent(message: unknown): SDKInputUserContentBlock[] {
+	const content = (message as { content?: unknown } | null | undefined)?.content;
+	if (typeof content === "string") {
+		return content ? [{ type: "text", text: content }] : [];
+	}
+
+	if (!Array.isArray(content)) return [];
+
+	const blocks: SDKInputUserContentBlock[] = [];
+	for (const block of content) {
+		if (typeof block !== "object" || block === null) continue;
+		const typed = block as { type?: unknown; text?: unknown; data?: unknown; mimeType?: unknown };
+
+		if (typed.type === "text" && typeof typed.text === "string" && typed.text) {
+			blocks.push({ type: "text", text: typed.text });
+		} else if (typed.type === "image" && typeof typed.data === "string") {
+			// Same normalization as `extractImageBlocksFromContext`, and for the same
+			// reason: the value can arrive as a `data:...;base64,` URI, which the SDK
+			// will not accept raw. A block with no resolvable media type is dropped
+			// there too.
+			const mimeType = typeof typed.mimeType === "string" && typed.mimeType
+				? typed.mimeType
+				: inferMimeTypeFromDataUri(typed.data);
+			if (!mimeType) continue;
+
+			blocks.push({
+				type: "image",
+				source: { type: "base64", media_type: mimeType, data: stripDataUriPrefix(typed.data) },
+			} as SDKInputUserContentBlock);
+		}
+	}
+
+	return blocks;
+}
+
+/**
+ * Hold the SDK input channel open for the life of a query.
+ *
+ * `query()` accepts `string | AsyncIterable<SDKUserMessage>`. A string, or an
+ * iterable that yields once and completes, shuts the input side before the turn
+ * begins -- so a steer typed mid-unit cannot reach the running query and waits
+ * for the whole GSD unit, which is one `query()` call.
+ *
+ * Delivery is at the next tool boundary rather than at unit end -- measured
+ * against the SDK's own binary at 0.3.229, so re-check it at an SDK bump.
+ *
+ * **Lifecycle is the whole risk.** An input iterable that never completes leaves
+ * the query waiting for input forever, which hangs the session with no error. So
+ * `close()` is idempotent and every exit path calls it -- completion, throw and
+ * abort. A generator parked on `next` is released by the same flag.
+ *
+ * Each `[Symbol.asyncIterator]()` replays the initial message before serving the
+ * queue. Production takes one iterator per channel and a fresh channel per
+ * readiness attempt -- sharing one across attempts let the abandoned attempt's
+ * parked reader win the next push and drop it unwritten -- so the replay is a
+ * property of the type rather than something the adapter relies on.
+ *
+ * `prompt` is what `query({ prompt })` takes; `push` queues a message for the
+ * running query and is a no-op once closed; `close` ends it, idempotently.
+ */
+export function createSdkInputChannel(initial: SDKInputUserMessage) {
+	const pending: SDKInputUserMessage[] = [];
+	let closed = false;
+	// A LIST, not a slot. Nothing stops a caller iterating twice, and a second
+	// generator parking would overwrite the first one's resolver -- stranding it
+	// forever, which is the exact hang this whole design exists to avoid,
+	// reintroduced inside the mitigation. (Production takes one iterator per
+	// channel; this holds the type honest for anyone who does not.)
+	let parked: (() => void)[] = [];
+
+	const wakeAll = (): void => {
+		const resume = parked;
+		parked = [];
+		for (const resolve of resume) resolve();
+	};
 
 	return {
-		async *[Symbol.asyncIterator]() {
-			yield sdkMessage;
+		prompt: {
+			async *[Symbol.asyncIterator]() {
+				yield initial;
+
+				while (true) {
+					while (pending.length > 0) {
+						yield pending.shift() as SDKInputUserMessage;
+					}
+
+					// Re-check after draining: close() may have landed while the loop
+					// was yielding, and a generator parked below would never see it.
+					if (closed) {
+						return;
+					}
+
+					await new Promise<void>((resolve) => {
+						parked.push(resolve);
+					});
+				}
+			},
+		},
+		push(message: SDKInputUserMessage): void {
+			if (closed) return;
+			pending.push(message);
+			wakeAll();
+		},
+		close(): void {
+			if (closed) return;
+			closed = true;
+			wakeAll();
 		},
 	};
 }
@@ -2430,6 +2568,10 @@ async function pumpSdkMessages(
 	let lastThinkingContent = "";
 	let milestoneStatusObservationRoot: string | undefined;
 	let milestoneStatusObservationToken: string | null = null;
+	// Declared out here so the single `finally` below closes it on EVERY exit --
+	// completion, throw and abort. An input iterable left open parks the query on
+	// input forever, which hangs the session with no error to show for it.
+	let inputChannel: ReturnType<typeof createSdkInputChannel> | null = null;
 	const clearMilestoneStatusObservation = (): void => {
 		if (!milestoneStatusObservationRoot || !milestoneStatusObservationToken) return;
 		const cleared = clearMilestoneStatusObservationTurn(
@@ -2514,7 +2656,52 @@ async function pumpSdkMessages(
 				gsdPhase,
 			),
 		});
-		const queryPrompt = buildSdkQueryPrompt(context, prompt);
+		const initialQueryMessage = buildSdkQueryMessage(context, prompt);
+
+		const getSteeringMessages = claudeOptions?.getSteeringMessages;
+		// Drained on every SDK message rather than on a timer: the boundaries that
+		// matter -- a tool call finishing, a turn starting -- ARE SDK messages, so
+		// this delivers as early as the CLI can act on it and costs nothing when
+		// the queue is empty.
+		//
+		// Draining REMOVES the message, so it must only run where the channel can
+		// still deliver -- otherwise a steer is destroyed rather than delayed, which
+		// is worse than the bug this fixes. `canDeliver` is that guard.
+		const drainSteersIntoChannel = async (canDeliver: boolean): Promise<void> => {
+			if (!getSteeringMessages || !canDeliver) return;
+
+			// Wide enough to cover the parse, not just the call: these arrive through
+			// an interface-merging extension point, so a shape neither branch expects
+			// must not take the unit down with it.
+			try {
+				for (const steer of await getSteeringMessages()) {
+					// Everything representable is delivered, including role "custom"
+					// records from `sendCustomMessage`. Filtering by role here was worse,
+					// not safer: this call DRAINS, so a skipped message is already out of
+					// the agent's queue and there is no re-queue seam on the options --
+					// "leave it to the agent loop" is not something this code can do.
+					// Re-emitting a custom record as a plain user message loses its
+					// customType/display/details, which beats losing the record whole.
+					const content = steeringMessageContent(steer);
+					// The residue: records carrying no representable content at all are
+					// dropped, because an empty content array is not a sendable message.
+					// See this patch's record.
+					if (content.length === 0) continue;
+
+					// Re-checked: the abort can land during the await above, and pushing
+					// into a channel the `finally` is about to close would destroy it.
+					if (options?.signal?.aborted) return;
+
+					inputChannel?.push({
+						type: "user",
+						message: { role: "user", content },
+						parent_tool_use_id: null,
+					});
+				}
+			} catch {
+				return;
+			}
+		};
 
 		// Emit start with an empty partial
 		const initialPartial: AssistantMessage = {
@@ -2600,6 +2787,16 @@ async function pumpSdkMessages(
 					toolCompletionTargetsById,
 					emittedExternalToolResultIds,
 				} = createSdkAttemptMessageState();
+				// A FRESH channel per attempt. Sharing one across readiness retries
+				// leaves the abandoned attempt's reader parked on the same queue: the
+				// SDK's `streamInput` always has an outstanding `next()`, so the next
+				// push wakes both, the stale generator shifts the message first, and
+				// then breaks on its own aborted flag without writing it -- the steer
+				// is out of the agent's queue and never sent. Closing the previous
+				// channel first drains that reader to completion with nothing pending.
+				inputChannel?.close();
+				inputChannel = createSdkInputChannel(initialQueryMessage);
+				const queryPrompt = inputChannel.prompt;
 				const controller = new AbortController();
 				const forwardAbort = (): void => controller.abort();
 				if (options?.signal) {
@@ -2616,6 +2813,8 @@ async function pumpSdkMessages(
 
 				try {
 					for await (const msg of queryResult as AsyncIterable<SDKMessage>) {
+					await drainSteersIntoChannel(
+						msg.type !== "result" && !options?.signal?.aborted && !controller.signal.aborted);
 					if (options?.signal?.aborted) {
 						// User-initiated cancel — emit an aborted error so the agent
 						// loop classifies this as a deliberate stop, not a transient
@@ -2919,5 +3118,6 @@ async function pumpSdkMessages(
 		});
 	} finally {
 		clearMilestoneStatusObservation();
+		inputChannel?.close();
 	}
 }

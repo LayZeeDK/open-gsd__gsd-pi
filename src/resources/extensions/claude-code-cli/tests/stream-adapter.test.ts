@@ -19,7 +19,8 @@ import {
 	handleClaudeCodePartialStreamEvent,
 	resolveClaudePermissionMode,
 	buildPromptFromContext,
-	buildSdkQueryPrompt,
+	buildSdkQueryMessage,
+	createSdkInputChannel,
 	buildSdkOptions,
 	resolveClaudeCodeCwd,
 	createClaudeCodeCanUseToolHandler,
@@ -177,6 +178,19 @@ function makeSdkSuccessResult(result = "done") {
 // ---------------------------------------------------------------------------
 // Existing tests — exhausted stream fallback (#2575)
 // ---------------------------------------------------------------------------
+
+/**
+ * Read the prompt text a query opens with, from the input channel that carries
+ * it. The channel stays open for the life of the query, so take ONE message
+ * rather than draining -- a for-await would never terminate.
+ */
+async function firstChannelText(prompt: unknown): Promise<string> {
+	assert.notEqual(typeof prompt, "string", "the input channel must not collapse back to a bare string");
+	const first = await (prompt as AsyncIterable<any>)[Symbol.asyncIterator]().next();
+	assert.equal(first.done, false, "the channel yielded nothing");
+	const blocks = first.value.message.content as { type: string; text?: string }[];
+	return blocks.filter((b) => b.type === "text").map((b) => b.text ?? "").join("\n");
+}
 
 describe("stream-adapter — exhausted stream fallback (#2575)", () => {
 	test("generator exhaustion becomes an error message instead of clean completion", () => {
@@ -431,18 +445,23 @@ describe("stream-adapter — image prompt forwarding (#4183)", () => {
 		]);
 	});
 
-	test("buildSdkQueryPrompt returns plain string when no images exist in context", () => {
+	test("buildSdkQueryMessage carries the prompt text when no images exist in context", () => {
+		// Upstream returned a plain STRING here, which shuts the input side before
+		// the turn begins. It is now the first message of a channel held open for
+		// the life of the query; the text it carries must be unchanged.
 		const context: Context = {
 			messages: [{ role: "user", content: "hello" } as Message],
 		};
 		const textPrompt = buildPromptFromContext(context);
 
-		const prompt = buildSdkQueryPrompt(context, textPrompt);
-		assert.equal(typeof prompt, "string");
-		assert.equal(prompt, textPrompt);
+		assert.deepEqual(buildSdkQueryMessage(context, textPrompt), {
+			type: "user",
+			message: { role: "user", content: [{ type: "text", text: textPrompt }] },
+			parent_tool_use_id: null,
+		});
 	});
 
-	test("buildSdkQueryPrompt wraps images and prompt text in an SDK user message iterable", async () => {
+	test("buildSdkQueryMessage wraps images and prompt text in one SDK user message", async () => {
 		const context: Context = {
 			messages: [
 				{
@@ -456,16 +475,15 @@ describe("stream-adapter — image prompt forwarding (#4183)", () => {
 		};
 		const textPrompt = buildPromptFromContext(context);
 
-		const prompt = buildSdkQueryPrompt(context, textPrompt);
-		assert.notEqual(typeof prompt, "string");
-		assert.ok(prompt && typeof (prompt as any)[Symbol.asyncIterator] === "function");
+		const channel = createSdkInputChannel(buildSdkQueryMessage(context, textPrompt));
 
-		const messages: any[] = [];
-		for await (const item of prompt as AsyncIterable<any>) {
-			messages.push(item);
-		}
-		assert.equal(messages.length, 1);
-		assert.deepEqual(messages[0], {
+		// Take ONE message rather than draining: the channel stays open by design,
+		// so a for-await over it does not terminate until close().
+		const first = await channel.prompt[Symbol.asyncIterator]().next();
+		channel.close();
+
+		assert.equal(first.done, false);
+		assert.deepEqual(first.value, {
 			type: "user",
 			message: {
 				role: "user",
@@ -485,7 +503,133 @@ describe("stream-adapter — image prompt forwarding (#4183)", () => {
 		});
 	});
 
-	test("buildSdkQueryPrompt image iterable can be consumed for each SDK retry", async () => {
+	const CHANNEL_SEED = {
+		type: "user" as const,
+		message: { role: "user" as const, content: [{ type: "text" as const, text: "seed" }] },
+		parent_tool_use_id: null,
+	};
+
+	function laterMessage(text: string) {
+		return {
+			type: "user" as const,
+			message: { role: "user" as const, content: [{ type: "text" as const, text }] },
+			parent_tool_use_id: null,
+		};
+	}
+
+	/** Reject rather than hang if a lifecycle case leaves the generator parked. */
+	function withinTimeout<T>(promise: Promise<T>, label: string): Promise<T> {
+		return Promise.race([
+			promise,
+			new Promise<never>((_, reject) =>
+				setTimeout(() => reject(new Error(`${label} did not settle -- the channel is stuck open`)), 1_000).unref?.(),
+			),
+		]);
+	}
+
+	test("the input channel stays open after yielding its initial message", async () => {
+		// The whole point: upstream shut the input side before the turn began, so a
+		// steer could not reach a running query and waited for the entire GSD unit.
+		const channel = createSdkInputChannel(CHANNEL_SEED);
+		const iterator = channel.prompt[Symbol.asyncIterator]();
+
+		assert.deepEqual((await iterator.next()).value, CHANNEL_SEED);
+
+		let settled = false;
+		void iterator.next().then(() => {
+			settled = true;
+		});
+		await new Promise((resolve) => setTimeout(resolve, 20));
+
+		assert.equal(settled, false, "the channel completed instead of waiting for input");
+		channel.close();
+	});
+
+	test("the input channel yields a message pushed after the turn started", async () => {
+		const channel = createSdkInputChannel(CHANNEL_SEED);
+		const iterator = channel.prompt[Symbol.asyncIterator]();
+		await iterator.next();
+
+		const pending = iterator.next();
+		channel.push(laterMessage("steer me"));
+
+		const delivered = await withinTimeout(pending, "a pushed message");
+
+		assert.equal(delivered.done, false);
+		assert.deepEqual(delivered.value, laterMessage("steer me"));
+		channel.close();
+	});
+
+	test("the input channel completes on close, including from a parked read", async () => {
+		// A generator parked on `next` is the hang this guards: an input iterable
+		// that never completes leaves the query waiting on input forever.
+		const channel = createSdkInputChannel(CHANNEL_SEED);
+		const iterator = channel.prompt[Symbol.asyncIterator]();
+		await iterator.next();
+
+		const parked = iterator.next();
+		channel.close();
+
+		assert.equal((await withinTimeout(parked, "close from a parked read")).done, true);
+	});
+
+	// Bounded by the runner: a stranded reader HANGS rather than failing, and an
+	// unbounded version of this test reports as "not reddened" under mutation
+	// because the whole run is killed instead.
+	test("closing the input channel releases every parked reader, not just the last", { timeout: 2_000 }, async () => {
+		// A single wake slot would strand the first generator forever -- the exact
+		// hang this design exists to prevent, reintroduced inside the mitigation.
+		// Production takes one iterator per channel, so this pins the type's
+		// contract rather than a path the adapter walks.
+		const channel = createSdkInputChannel(CHANNEL_SEED);
+		const first = channel.prompt[Symbol.asyncIterator]();
+		const second = channel.prompt[Symbol.asyncIterator]();
+		await first.next();
+		await second.next();
+
+		const parkedFirst = first.next();
+		const parkedSecond = second.next();
+		// Park in order, so a single-slot implementation drops the FIRST resolver.
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		channel.close();
+
+		assert.equal((await parkedFirst).done, true, "the first parked reader was stranded");
+		assert.equal((await parkedSecond).done, true);
+	});
+
+	test("the input channel closes idempotently", async () => {
+		// The abort and completion paths can both fire, and `pumpSdkMessages` closes
+		// in a single `finally` that a thrown attempt reaches too.
+		const channel = createSdkInputChannel(CHANNEL_SEED);
+		const iterator = channel.prompt[Symbol.asyncIterator]();
+		await iterator.next();
+
+		channel.close();
+		channel.close();
+		channel.push(laterMessage("too late"));
+		channel.close();
+
+		assert.equal((await withinTimeout(iterator.next(), "a repeated close")).done, true);
+	});
+
+	test("the input channel drains what was already queued before completing", async () => {
+		// Close must not discard a steer that landed first: the CLI can still act on
+		// it, and dropping it silently is the failure this patch exists to fix.
+		const channel = createSdkInputChannel(CHANNEL_SEED);
+		const iterator = channel.prompt[Symbol.asyncIterator]();
+		await iterator.next();
+
+		channel.push(laterMessage("queued first"));
+		channel.close();
+
+		const drained = await withinTimeout(iterator.next(), "a queued message at close");
+
+		assert.equal(drained.done, false);
+		assert.deepEqual(drained.value, laterMessage("queued first"));
+		assert.equal((await withinTimeout(iterator.next(), "completion after drain")).done, true);
+	});
+
+	test("the input channel replays its initial message for each SDK retry", async () => {
 		const context: Context = {
 			messages: [
 				{
@@ -498,20 +642,16 @@ describe("stream-adapter — image prompt forwarding (#4183)", () => {
 			],
 		};
 		const textPrompt = buildPromptFromContext(context);
-		const prompt = buildSdkQueryPrompt(context, textPrompt);
+		const channel = createSdkInputChannel(buildSdkQueryMessage(context, textPrompt));
 
-		const firstAttempt = [];
-		for await (const item of prompt as AsyncIterable<any>) {
-			firstAttempt.push(item);
-		}
+		// The adapter retries a failed attempt with the SAME prompt value, so each
+		// iteration must replay the initial message rather than start empty.
+		const firstAttempt = await channel.prompt[Symbol.asyncIterator]().next();
+		const retryAttempt = await channel.prompt[Symbol.asyncIterator]().next();
+		channel.close();
 
-		const retryAttempt = [];
-		for await (const item of prompt as AsyncIterable<any>) {
-			retryAttempt.push(item);
-		}
-
-		assert.equal(firstAttempt.length, 1);
-		assert.deepEqual(retryAttempt, firstAttempt);
+		assert.equal(firstAttempt.done, false);
+		assert.deepEqual(retryAttempt.value, firstAttempt.value);
 	});
 
 	test("SDK readiness retries do not leak partial content into the next attempt", async () => {
@@ -2462,6 +2602,198 @@ describe("stream-adapter — session persistence (#2859)", () => {
 	});
 });
 
+describe("stream-adapter — steering reaches a running query", () => {
+	const SDK_RESULT = {
+		type: "result",
+		subtype: "success",
+		uuid: "result-steer",
+		session_id: "session-steer",
+		duration_ms: 1,
+		duration_api_ms: 1,
+		is_error: false,
+		num_turns: 1,
+		result: "completed",
+		stop_reason: "end_turn",
+		total_cost_usd: 0,
+		usage: { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+	};
+
+	/**
+	 * Drive one turn and return every message the query's input channel carried.
+	 * Safe to drain: `pumpSdkMessages` closes the channel in its `finally`, so by
+	 * the time the stream settles the iterable terminates.
+	 */
+	async function runTurnCapturingInput(
+		getSteeringMessages?: () => Promise<any[]>,
+	): Promise<any[]> {
+		const cwd = realpathSync(mkdtempSync(join(tmpdir(), "claude-sdk-steer-")));
+		// What the QUERY received, read as a real consumer would. Draining the
+		// channel after the stream settles instead would measure whatever was left
+		// stranded in the queue at close -- which is the bug, not the delivery.
+		const delivered: any[] = [];
+		const stream = streamViaClaudeCode(
+			{ id: "claude-sonnet-4-6" } as any,
+			{ systemPrompt: "UNIT: Execute", messages: [{ role: "user", content: "Do the work." } as Message] },
+			{
+				cwd,
+				_skipWorkflowMcpPreflightForTest: true,
+				getSteeringMessages,
+				async *_sdkQueryForTest(args: { prompt: string | AsyncIterable<unknown> }) {
+					const input = (args.prompt as AsyncIterable<any>)[Symbol.asyncIterator]();
+					delivered.push((await input.next()).value);
+					// One message before the result, so the adapter reaches its drain
+					// point mid-turn exactly as it does between real tool rounds.
+					yield { type: "system", subtype: "other", uuid: "sys-1", session_id: "session-steer" };
+
+					// Read whatever the drain pushed, WITHOUT parking forever when it
+					// pushed nothing: race the read against a turn of the event loop.
+					const next = await Promise.race([
+						input.next(),
+						new Promise((resolve) => setTimeout(() => resolve(null), 50)),
+					]);
+					if (next && !(next as any).done) delivered.push((next as any).value);
+
+					yield SDK_RESULT;
+				},
+			} as any,
+		);
+
+		await stream.result();
+
+		return delivered;
+	}
+
+	test("a steer queued mid-turn is pushed into the open input channel", async () => {
+		// The wiring, not the channel: without the drain call in the SDK message
+		// loop, every channel test still passes and nothing reaches the query.
+		let drained = false;
+		const delivered = await runTurnCapturingInput(async () => {
+			if (drained) return [];
+			drained = true;
+			return [{ role: "user", content: [{ type: "text", text: "STEER-TEXT" }] }];
+		});
+
+
+		assert.equal(delivered.length, 2, "the query received the initial message and then the steer");
+		assert.deepEqual(delivered[1], {
+			type: "user",
+			message: { role: "user", content: [{ type: "text", text: "STEER-TEXT" }] },
+			parent_tool_use_id: null,
+		});
+	});
+
+	test("the steering queue is not drained where the channel can no longer deliver", async () => {
+		// Draining REMOVES the message. Taken on the terminal iteration it is pushed
+		// into a channel that closes moments later and is destroyed silently; left
+		// alone, the agent loop picks it up exactly as it does today. The delivered
+		// count is 1 either way, so the observable is whether the queue was READ.
+		let reads = 0;
+		const delivered = await runTurnCapturingInput(async () => {
+			reads += 1;
+			return [];
+		});
+
+		assert.equal(delivered.length, 1);
+		assert.equal(reads, 1, "the terminal message must not drain the queue");
+	});
+
+	test("a steer carrying an image keeps the image", async () => {
+		// Drained here means it never reaches the agent loop either, so dropping the
+		// image would lose it outright rather than defer it.
+		let drained = false;
+		const delivered = await runTurnCapturingInput(async () => {
+			if (drained) return [];
+			drained = true;
+			return [{
+				role: "user",
+				content: [
+					{ type: "text", text: "look" },
+					{ type: "image", data: "ZmFrZQ==", mimeType: "image/jpeg" },
+				],
+			}];
+		});
+
+		assert.equal(delivered.length, 2);
+		assert.deepEqual(delivered[1].message.content, [
+			{ type: "text", text: "look" },
+			{ type: "image", source: { type: "base64", media_type: "image/jpeg", data: "ZmFrZQ==" } },
+		]);
+	});
+
+	test("a steered image arrives normalized the same way a prompt image does", async () => {
+		// The sibling prompt path strips `data:...;base64,` because the SDK will not
+		// take it raw. Two policies for one shape in one file is how that diverges.
+		let drained = false;
+		const delivered = await runTurnCapturingInput(async () => {
+			if (drained) return [];
+			drained = true;
+			return [{
+				role: "user",
+				content: [{ type: "image", data: "data:image/png;base64,ZmFrZQ==" }],
+			}];
+		});
+
+		assert.equal(delivered.length, 2);
+		assert.deepEqual(delivered[1].message.content, [
+			{ type: "image", source: { type: "base64", media_type: "image/png", data: "ZmFrZQ==" } },
+		]);
+	});
+
+	test("a non-user queued message is delivered rather than destroyed", async () => {
+		// The queue is not user-steers-only: `sendCustomMessage` enqueues role
+		// "custom" records. Skipping one here does NOT leave it for the agent loop --
+		// this call drains, so it is already gone and there is no re-queue seam.
+		// Re-emitting it loses customType/display/details; that beats losing it.
+		let drained = false;
+		const delivered = await runTurnCapturingInput(async () => {
+			if (drained) return [];
+			drained = true;
+			return [{ role: "custom", customType: "bashExecution", content: [{ type: "text", text: "carried" }] }];
+		});
+
+		assert.equal(delivered.length, 2, "the record's content still reaches the query");
+		assert.deepEqual(delivered[1].message.content, [{ type: "text", text: "carried" }]);
+	});
+
+	test("a malformed steer does not take the turn down", async () => {
+		// The seam is typed against an interface-merging extension point, so a shape
+		// neither branch expects is possible -- and must not surface as a provider
+		// error. The old guard covered the call but not the parse below it.
+		let drained = false;
+		const delivered = await runTurnCapturingInput(async () => {
+			if (drained) return [];
+			drained = true;
+			return [{ role: "user", content: { not: "an array" } }];
+		});
+
+		assert.equal(delivered.length, 1, "the turn proceeds with just its initial message");
+	});
+
+	test("an unsteered turn carries exactly one message", async () => {
+		// Blast radius: this patch moves EVERY unit from string mode to a channel,
+		// not just steered ones, so the unsteered turn must be unchanged.
+		const delivered = await runTurnCapturingInput(async () => []);
+
+		assert.equal(delivered.length, 1, "nothing extra may reach the query");
+	});
+
+	test("a turn with no steering source at all still completes", async () => {
+		// `getSteeringMessages` is absent from the SimpleStreamOptions TYPE and only
+		// present at runtime, so a caller that does not supply it must not hang.
+		const delivered = await runTurnCapturingInput(undefined);
+
+		assert.equal(delivered.length, 1);
+	});
+
+	test("a steering source that throws does not take the turn down", async () => {
+		const delivered = await runTurnCapturingInput(async () => {
+			throw new Error("steering queue unavailable");
+		});
+
+		assert.equal(delivered.length, 1, "the turn proceeds with just its initial message");
+	});
+});
+
 describe("stream-adapter — workflow MCP readiness", () => {
 	test("strict slice phase prompt omits workflow MCP question guidance when allowedTools omit it", async () => {
 		const cwd = realpathSync(mkdtempSync(join(tmpdir(), "claude-sdk-strict-question-prompt-")));
@@ -2523,8 +2855,9 @@ describe("stream-adapter — workflow MCP readiness", () => {
 
 				await stream.result();
 
-				assert.equal(typeof capturedPrompt, "string", phase.type);
-				const prompt = capturedPrompt as string;
+				// The prompt is now a held-open channel rather than a bare string, so
+				// read the text out of the message the query actually opens with.
+				const prompt = await firstChannelText(capturedPrompt);
 				assert.ok(capturedAllowedTools?.includes(phase.expectedTool), phase.type);
 				assert.ok(!capturedAllowedTools?.includes("mcp__gsd-workflow__ask_user_questions"), phase.type);
 				assert.ok(!prompt.includes("mcp__gsd-workflow__ask_user_questions"), phase.type);
