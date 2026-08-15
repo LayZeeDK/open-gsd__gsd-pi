@@ -1334,6 +1334,178 @@ test("formatFailureContext: caps total output at 10,000 chars", () => {
   assert.ok(output.includes("…[remaining failures truncated]"), "should include total truncation marker");
 });
 
+/**
+ * True when every fenced block opened in `text` is also closed.
+ *
+ * Counting fences cannot answer this: a check's own output legitimately
+ * contains them. Follow the CommonMark rule instead -- an opening run of N
+ * backticks is closed only by a line that is a run of at least N and nothing
+ * else -- and report whether one is still open at the end.
+ *
+ * Scoped to what `formatFailureContext` emits, not to markdown at large: it
+ * treats a line like ```` ```a`b ```` as an opener where CommonMark forbids a
+ * backtick in a backtick-fence info string, which could in principle pass a
+ * phantom opener. Unreachable here, because a heading always precedes the first
+ * fence-shaped line of a block.
+ */
+function fencesBalanced(text: string): boolean {
+  let open: number | null = null;
+  for (const line of text.split("\n")) {
+    const match = /^ {0,3}(`{3,})/.exec(line);
+    if (!match) continue;
+    const run = match[1];
+
+    if (open === null) {
+      open = run.length;
+    } else if (run.length >= open && line.trim() === run) {
+      open = null;
+    }
+  }
+
+  return open === null;
+}
+
+test("formatFailureContext: a check whose output contains a fence leaves no block open", () => {
+  // The block is injected into a retry prompt with the real instructions
+  // appended after it. A fence left open swallows all of them.
+  const result: import("../types.ts").VerificationResult = {
+    passed: false,
+    checks: [{
+      command: "npm run lint:md",
+      exitCode: 1,
+      stdout: "",
+      stderr: "oops\n```\nmore",
+      durationMs: 100,
+    }],
+    discoverySource: "preference",
+    timestamp: Date.now(),
+  };
+
+  const output = formatFailureContext(result);
+
+  assert.ok(output.includes("```\nmore"), "the content's own fence survives verbatim");
+  assert.ok(
+    fencesBalanced(`${output}\n\n---\n\nreal instructions`),
+    `the appended prompt was swallowed by an open block:\n${output}`,
+  );
+});
+
+test("formatFailureContext: a multi-line command cannot break out of its own block", () => {
+  // A `###` heading is one line. Prose reaching `check.command` is a documented
+  // failure mode, and a newline followed by a fence opens a block that the
+  // block's own closing delimiter then consumes -- leaving the real one open.
+  const result: import("../types.ts").VerificationResult = {
+    passed: false,
+    checks: [{
+      command: "run the tests\n```\nand check the output",
+      exitCode: 1,
+      stdout: "",
+      stderr: "boom",
+      durationMs: 100,
+    }],
+    discoverySource: "preference",
+    timestamp: Date.now(),
+  };
+
+  const output = formatFailureContext(result);
+
+  assert.ok(
+    fencesBalanced(`${output}\n\n---\n\nreal instructions`),
+    `the appended prompt was swallowed by an open block:\n${output}`,
+  );
+  assert.equal(output.split("\n")[2], "### ❌ `run the tests ``` and check the output` (exit code 1)");
+});
+
+test("formatFailureContext: a body that hits the total cap ends at a block boundary", () => {
+  const checks: import("../types.ts").VerificationCheck[] = [];
+  for (let i = 0; i < 20; i++) {
+    checks.push({
+      command: `failing-command-${i}`,
+      exitCode: 1,
+      // The stray fence goes in an EARLY check so the last block is unambiguous.
+      // The trailing marker is what makes a mid-block cut visible at all: the
+      // filler is uniform, so slicing it leaves no trace.
+      stderr: (i === 0 ? "```\n" : "") + "e".repeat(1_000) + `\nEND-${i}`,
+      stdout: "",
+      durationMs: 100,
+    });
+  }
+  const result: import("../types.ts").VerificationResult = {
+    passed: false,
+    checks,
+    discoverySource: "preference",
+    timestamp: Date.now(),
+  };
+
+  const output = formatFailureContext(result);
+
+  assert.ok(output.includes("…[remaining failures truncated]"), "later checks were dropped");
+  assert.ok(fencesBalanced(output), `a fence was left open:\n${output.slice(-400)}`);
+
+  const kept = [...output.matchAll(/### ❌ `failing-command-(\d+)`/g)].map((m) => Number(m[1]));
+  assert.ok(kept.length > 0 && kept.length < checks.length, `expected a partial set, kept ${kept.length}`);
+  for (const i of kept) {
+    assert.ok(output.includes(`END-${i}`), `check ${i} was cut mid-block instead of dropped whole`);
+  }
+});
+
+test("formatFailureContext: a long command cannot push the body past the total cap", () => {
+  // The per-check cap bounds the OUTPUT, not the command. A block-granular cap
+  // that keeps the first block unconditionally is unbounded without this.
+  const result: import("../types.ts").VerificationResult = {
+    passed: false,
+    checks: [
+      { command: `node -e "${"x".repeat(40_000)}"`, exitCode: 1, stdout: "", stderr: "boom", durationMs: 100 },
+      { command: "npm run test", exitCode: 1, stdout: "", stderr: "SECOND-CHECK", durationMs: 100 },
+    ],
+    discoverySource: "preference",
+    timestamp: Date.now(),
+  };
+
+  const output = formatFailureContext(result);
+
+  assert.ok(output.length <= 10_100, `bounded near the cap, got ${output.length}`);
+  assert.ok(output.includes("SECOND-CHECK"), "bounding the command leaves room for the checks that follow");
+});
+
+test("formatFailureContext: cutting a long command does not split a character in half", () => {
+  // `truncate`, the sibling doing this job for output, cuts on character
+  // boundaries for the same reason. A naive `slice` at a fixed offset emits a
+  // lone surrogate whenever an astral character straddles it.
+  const result: import("../types.ts").VerificationResult = {
+    passed: false,
+    checks: [{
+      command: "a".repeat(199) + "\u{1F600}" + "b".repeat(200),
+      exitCode: 1,
+      stdout: "",
+      stderr: "boom",
+      durationMs: 100,
+    }],
+    discoverySource: "preference",
+    timestamp: Date.now(),
+  };
+
+  const output = formatFailureContext(result);
+  const lone = [...output].filter((c) => c.length === 1 && c.charCodeAt(0) >= 0xd800 && c.charCodeAt(0) <= 0xdfff);
+
+  assert.deepEqual(lone, [], "the cut split a surrogate pair");
+  assert.ok(output.includes("...[command truncated]"), "the command was cut at all");
+});
+
+test("formatFailureContext: an under-cap body is returned unchanged", () => {
+  const result: import("../types.ts").VerificationResult = {
+    passed: false,
+    checks: [{ command: "npm run lint", exitCode: 2, stdout: "", stderr: "boom", durationMs: 100 }],
+    discoverySource: "preference",
+    timestamp: Date.now(),
+  };
+
+  assert.equal(
+    formatFailureContext(result),
+    "## Verification Failures\n\n### ❌ `npm run lint` (exit code 2)\n```stderr\nboom\n```",
+  );
+});
+
 // ─── captureRuntimeErrors Tests (S04/T01) ─────────────────────────────────────
 
 function makeProc(overrides: Record<string, unknown>) {

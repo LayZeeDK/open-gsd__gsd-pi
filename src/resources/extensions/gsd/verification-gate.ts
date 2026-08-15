@@ -348,8 +348,55 @@ function hasPythonTests(dir: string): boolean {
 /** Target bytes of command output retained per failed check. See `truncate` for the bound. */
 const MAX_FAILURE_OUTPUT_PER_CHECK = 2_000;
 
-/** Maximum total chars for the combined failure context. */
+/**
+ * Maximum total chars for the combined failure context.
+ *
+ * Must stay above one block's worth, because `formatFailureContext` keeps its
+ * first block unconditionally; below that the backstop slice there becomes
+ * reachable, and it is the one path that cuts a block rather than dropping it.
+ *
+ * A block is NOT `output + command + overhead`. `fenceFor` sizes each delimiter
+ * past the longest backtick run in the output and emits it twice, so all-backtick
+ * output costs about three times the output cap:
+ *
+ *     3 x MAX_FAILURE_OUTPUT_PER_CHECK + MAX_FAILURE_COMMAND_CHARS + ~260
+ *
+ * Measured worst case at the current values: 6,383 chars against this 10,000,
+ * peaking at 2,034 backticks of stderr -- the largest input `truncate` still
+ * returns unchanged, not at the 2,000 budget. The naive two-term formula gives
+ * 2,460, so raising the output cap on that reading would look safe at 3,000
+ * (true worst ~9,300) and go live at 3,300.
+ *
+ * `MAX_FAILURE_OUTPUT_PER_CHECK` is therefore the one to keep far below this,
+ * not merely under it: it sizes the DELIMITER LINE, and the backstop closes the
+ * fence it assumes the cut landed inside. A cut landing inside a ~2,000-char
+ * opening delimiter would make the appended close an opener instead.
+ */
 const MAX_FAILURE_CONTEXT_CHARS = 10_000;
+
+/**
+ * Maximum code points of a check's command retained in its heading. The
+ * per-check cap above bounds the OUTPUT only, so an unbounded command -- a
+ * failing `node -e "<40 KB script>"` -- otherwise walks straight past the total
+ * cap.
+ */
+const MAX_FAILURE_COMMAND_CHARS = 200;
+
+/**
+ * A fence long enough that nothing in `output` can close it early.
+ *
+ * A check's own output can contain a fence: a markdown linter, a doc test
+ * echoing a snippet, a formatter over `.md`. With a three-backtick delimiter
+ * that inner fence closes the block, the rest of the output leaks as prose, and
+ * the block's own closing fence OPENS a new one -- which then swallows the
+ * retry prompt appended after this text. Sizing the delimiter past the longest
+ * run in the content is the standard fenced-block rule and needs no counting.
+ */
+function fenceFor(output: string): string {
+  let longest = 0;
+  for (const run of output.match(/`+/g) ?? []) longest = Math.max(longest, run.length);
+  return "`".repeat(Math.max(3, longest + 1));
+}
 
 /**
  * Format failed verification checks into a prompt-injectable text block.
@@ -357,7 +404,11 @@ const MAX_FAILURE_CONTEXT_CHARS = 10_000;
  * Each failed check gets a heading with the command name and exit code,
  * followed by a truncated stderr excerpt. Individual stderr is capped to
  * about 2 000 bytes (`truncate` bounds the retained output, not the returned
- * string); total output is capped to 10 000 chars.
+ * string); the total is capped to 10 000 chars plus the truncation marker,
+ * which is appended after the check.
+ *
+ * The result is injected into a retry prompt that appends further instructions
+ * AFTER it, so no code fence may be left open -- see `fenceFor`.
  *
  * Returns an empty string when all checks pass or the checks array is empty.
  */
@@ -365,7 +416,9 @@ export function formatFailureContext(result: VerificationResult): string {
   const failures = result.checks.filter((c) => c.exitCode !== 0);
   if (failures.length === 0) return "";
 
+  const header = "## Verification Failures\n\n";
   const blocks: string[] = [];
+  let truncated = false;
 
   for (const check of failures) {
     const hasStderr = (check.stderr ?? "").trim().length > 0;
@@ -375,19 +428,63 @@ export function formatFailureContext(result: VerificationResult): string {
     // it drops whole later checks, and the first failure is usually the root
     // cause with the rest cascading from it.
     const output = truncate(hasStderr ? check.stderr ?? "" : check.stdout ?? "", MAX_FAILURE_OUTPUT_PER_CHECK);
+    // A `###` heading is one line, so flatten the command first. A newline in it
+    // -- prose routed into a task plan's `Verify` field is a documented failure
+    // mode -- otherwise breaks the heading, and a fence after that newline opens
+    // a block that the delimiter below then closes, leaving the real block open.
+    // Flattened, backticks in the command can only spoil an inline code span.
+    // Trimmed as well, matching `formatFailureSignature` below, so a command
+    // ending in a newline does not render a stray space inside the code span.
+    const flat = check.command.replace(/\s+/gu, " ").trim();
+    // Cut on code points so a surrogate pair cannot be split. `truncate` is the
+    // sibling for this job and is deliberately not reused: it keeps both ends
+    // around a marker containing a newline, which a heading cannot carry.
+    const points = [...flat];
+    const command = points.length > MAX_FAILURE_COMMAND_CHARS
+      ? points.slice(0, MAX_FAILURE_COMMAND_CHARS).join("") + "...[command truncated]"
+      : flat;
+    const fence = fenceFor(output);
+    const block = `### ❌ \`${command}\` (exit code ${check.exitCode})\n${fence}${outputLabel}\n${output}\n${fence}`;
 
-    blocks.push(
-      `### ❌ \`${check.command}\` (exit code ${check.exitCode})\n\`\`\`${outputLabel}\n${output}\n\`\`\``,
-    );
+    // Spend the cap per block. Slicing the joined body at a character offset
+    // instead lands anywhere, including inside a block, leaving its fence open.
+    // Bound by the body this will actually emit rather than by a running total,
+    // which has to mirror the join and has nothing to catch it drifting. The
+    // first block is kept unconditionally so at least one failure survives; the
+    // backstop below is what keeps that from making the cap advisory.
+    if (blocks.length > 0
+      && header.length + [...blocks, block].join("\n\n").length > MAX_FAILURE_CONTEXT_CHARS) {
+      truncated = true;
+      break;
+    }
+
+    blocks.push(block);
   }
 
   let body = blocks.join("\n\n");
-  const header = "## Verification Failures\n\n";
 
   if (header.length + body.length > MAX_FAILURE_CONTEXT_CHARS) {
-    body =
-      body.slice(0, MAX_FAILURE_CONTEXT_CHARS - header.length) +
-      "\n\n…[remaining failures truncated]";
+    // Unreachable at the current constants, and kept so that raising a per-check
+    // bound cannot silently make the total one advisory -- see
+    // MAX_FAILURE_CONTEXT_CHARS. It can only ever cut the FIRST block: every
+    // later one was pushed only after the joined body was measured under the cap,
+    // so `blocks.length > 1` implies this cannot fire.
+    //
+    // Drop the partial last line before closing, so a cut landing inside a
+    // delimiter cannot leave half of one for the close to pair with. What remains
+    // ends at a line boundary, and the open delimiter is itself a run within
+    // `cut`, so sizing the close against `cut` can never be short. With no line
+    // boundary at all there is no block to close and nothing worth keeping --
+    // appending a delimiter there would OPEN one, which is the defect this whole
+    // function exists to prevent.
+    const cut = body.slice(0, MAX_FAILURE_CONTEXT_CHARS - header.length);
+    const lastBreak = cut.lastIndexOf("\n");
+    body = lastBreak === -1 ? "" : `${cut.slice(0, lastBreak)}\n${fenceFor(cut)}`;
+    truncated = true;
+  }
+
+  if (truncated) {
+    body += "\n\n…[remaining failures truncated]";
   }
 
   return header + body;
