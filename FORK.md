@@ -522,7 +522,8 @@ node --import ./src/resources/extensions/gsd/tests/resolve-ts.mjs \
 > That suite carries one pre-existing failure on this host,
 > `buildSdkOptions prefers workflow MCP question tools over native
 > AskUserQuestion`, asserting `/tmp/project` against `C:\tmp\project`. Baseline
-> it; 1 of 205 is the expected shape.
+> it. **1 of 220 is the expected shape as of patch 28**, which added 15 cases and
+> reshaped three upstream ones (the query prompt is no longer a bare string).
 
 Patch 14 also lands cases in `packages/mcp-server/src/mcp-server.test.ts`, which
 that package's own suite runs:

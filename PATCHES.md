@@ -60,6 +60,7 @@ Full build, link and rebase procedure: **[FORK.md](FORK.md)**.
 | 25 | `a9f89297` | answer tool calls an aborted tool batch leaves unresolved | not filed |
 | 26 | `3f50b6a9` | a failure-context fence that swallows the retry prompt | not filed |
 | 27 | `344cb25c` | a Windows control-file race is retried where it happens | not filed |
+| 28 | `fec23b83` | steering never reached a query already in flight | not filed |
 
 Patch 8 spans **two** commits: `d44f1275` (`test(mcp-server): pin elicitation
 behaviour across client capability shapes`) lands `elicitation-capability.test.ts`
@@ -1361,6 +1362,94 @@ that cannot fail is worse than no test.
 a green run nor a red one proves anything. FORK.md's claim that it was "all clean"
 is corrected in the same pass.
 
+---
+
+### 28. Steering never reached a query already in flight
+
+`steer` did not redirect work in flight: a message typed mid-unit surfaced only
+when the unit ended, indistinguishable from `followUp`. `stream-adapter.ts` calls
+`query()` **once per GSD unit** and the SDK runs Claude Code's whole agent loop
+inside it, while `buildSdkQueryPrompt` handed that call either a plain string or
+an iterable that yielded once and completed -- shutting the input side before the
+turn began, so there was nothing for a steer to reach.
+
+**Measured before any code was written**, per the plan's own gate. A scratchpad
+harness drove `query()` in streaming-input mode against the SDK's own binary with
+a five-tool prompt, pushing a message the instant the first `tool_use` appeared:
+
+| priority | outcome | turns | cost |
+| --- | --- | --- | --- |
+| unset | steer acted on after **1 of 5** tool calls | 2 | $0.641 |
+| `'now'` | steer never delivered; query ended after the first tool result | 2 | $0.033 |
+
+So a multi-tool unit is NOT one long CLI turn, and this buys a tool round rather
+than a unit. `priority` is declared on `SDKUserMessage` with no doc comment and
+the one run that set it lost the message and abandoned the work, so it is left
+unset. Both n=1.
+
+**The seam already existed, and finding it is what kept the patch to one file.**
+`agent-loop.ts` spreads the whole `AgentLoopConfig` into the options it hands the
+provider, and `getSteeringMessages` is a member of it -- so the drain callback has
+been arriving at `streamViaClaudeCode` all along, absent only from the
+`SimpleStreamOptions` TYPE. Declaring it on the adapter's own
+`ClaudeCodeStreamOptions` consumes it with no upstream contract change, no new
+cross-package dependency and no module-level global. A review round had already
+concluded the patch was BLOCKED for want of exactly this seam, having traced the
+queue forward and the contract backward without ever reading the call site. The
+plan keeps that mistake on the record: **reading types is not reading code.**
+
+**Draining bounds delivery to at-MOST-once, and that asymmetry is the sharp
+edge.** Draining removes the message from the agent's queue, so a drain that
+cannot deliver destroys user input rather than delaying it -- strictly worse than
+the bug being fixed. Review found three such windows; the drain is now guarded by
+whether the channel can still deliver (not on the terminal `result`, not once
+`options.signal` is aborted, not once the attempt controller has been aborted for
+a retry), leaving the steer in the queue for the agent loop instead. One window
+is not closeable from here: the SDK's `streamInput` checks its abort flag AFTER
+pulling a message and before writing it.
+
+**`interrupt()` is deliberately refused** even though streaming mode makes it
+available and it would land a steer immediately. A GSD tool call is frequently a
+durable mutation, and an aborted tool resolves synthetically while the real work
+continues in the background -- the mutation completes with nobody recording its
+result. That is the corruption the fork's projection-lock and dispatch-ledger
+patches exist to prevent.
+
+Two more things review found, both silent-data-loss shaped:
+
+- **The queue is not user-steers-only.** `sendCustomMessage` enqueues role
+  `custom` records carrying customType/display/details; re-emitting one as a
+  plain SDK user message would mangle it and drop it from the transcript. Only
+  role `user` is taken.
+- **Steer images were being dropped.** `queueSteer` accepts them and the RPC mode
+  passes them, and because the message is drained here it never reaches the agent
+  loop either -- so dropping them lost them outright. They are carried through.
+
+**Known limits.** A steer delivered this way never enters the pi transcript, so
+it is not rendered, not persisted, absent from the next unit's prompt, and the
+queued-message badge does not decrement until the next prompt or session change
+-- closing any of that needs a `gsd-agent-core` change. A steer pushed to a failed
+attempt is not replayed. And CLI teardown changes shape for every unit: the SDK
+sets `isSingleUserTurn` from `typeof prompt === "string"` and no longer calls
+`transport.endInput()` on a result, so CLI-side on-EOF work now runs under a
+parent-initiated close. Argv is identical and cleanup flushes before a bounded
+wait, so no orphan -- but the probe measured delivery, not teardown.
+
+**Two test traps worth naming**, both the same class the fork keeps meeting:
+
+- **The wiring test passed for the wrong reason.** Its fake query never iterated
+  `args.prompt`; draining the channel after the stream settled measured whatever
+  was stranded at close -- the bug itself -- and would have passed in a world
+  where the SDK never read the channel. It now consumes the channel from inside
+  the fake, concurrently with the turn.
+- **A hang is not a failure.** The waiter list must release EVERY parked reader,
+  since the channel is re-iterated per retry attempt. The test pinning that was
+  unbounded at first, so under mutation a stranded reader killed the whole run
+  and the battery reported "nothing reddened". It is `{ timeout }`-bounded now.
+
+The terminal-drain guard is pinned by counting queue READS rather than
+deliveries, because the delivered count is 1 either way.
+
 ## The SDK bump 0.2.83 -> 0.3.229
 
 Not a patch: a fork-local dependency decision, so it is listed separately and is
@@ -1753,7 +1842,7 @@ porting. B3, B4 and B7 were each re-confirmed still open at **v1.15.0**:
   kill. The most dangerous item on the list and the least suited to being rushed
   in behind four others. **Citation corrected at the v1.15.0 rebase** -- earlier
   editions cited `commands-maintenance.ts`, which now only re-exports it.
-**Planned, then withdrawn or blocked (2026-08-15):**
+**Planned, then shipped or withdrawn (2026-08-15):**
 
 - **Steering never reaches a running query** -- a message typed mid-unit surfaces
   only when the unit ends. `stream-adapter.ts` calls the Agent SDK's `query()`
@@ -1772,18 +1861,11 @@ porting. B3, B4 and B7 were each re-confirmed still open at **v1.15.0**:
   returned after the first tool result having emitted no text, and the work was
   abandoned. Do not set `priority`.
 
-  **Blocked on a design decision, not on evidence.** There is no seam to route the
-  steer through. `queueSteer` reaches `agent.steer()` in `gsd-agent-core`; the
-  queue is drained by `getSteeringMessages`, an `AgentLoopConfig` callback the
-  loop never passes to the provider; and `StreamFunction` is
-  `(model, context, options?)`, so `streamViaClaudeCode` cannot see it. Closing
-  that needs either a module-level push registry in the extension (making a
-  *package* depend on an *extension*, with no precedent -- the one existing
-  module-global of that shape is called only from the extension's own `index.ts`)
-  or widening the provider contract in `pi-ai` (a permanent fork delta on three
-  rebase-sensitive surfaces instead of one). A partial patch is not an option: an
-  input iterable held open that nothing pushes to is the design's main stated risk
-  with none of the benefit. Full record in the plan file.
+  **SHIPPED as patch 28.** A review round concluded this was blocked for want of
+  a seam to route the steer through, having traced the steering queue forward and
+  the provider contract backward without reading the one line where the loop calls
+  the provider -- `agent-loop.ts` spreads the whole `AgentLoopConfig` into the
+  options, so `getSteeringMessages` was already arriving. Full record in the plan file.
 
 - **Plumbing the failure text into the durable recovery record** -- WITHDRAWN
   before implementation. Three review rounds each falsified a premise it was built
